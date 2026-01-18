@@ -1,0 +1,97 @@
+{
+  "task": "SSVEP",
+  "sampling_rate": 250,
+  "total_configs": 11,
+  "successful_configs": 0,
+  "best_config": null,
+  "all_results": [
+    {
+      "task": "SSVEP",
+      "config_name": "default",
+      "nperseg": 128,
+      "noverlap": 112,
+      "nfft": 512,
+      "error": "'lr'"
+    },
+    {
+      "task": "SSVEP",
+      "config_name": "nperseg_64",
+      "nperseg": 64,
+      "noverlap": 56,
+      "nfft": 512,
+      "error": "'lr'"
+    },
+    {
+      "task": "SSVEP",
+      "config_name": "overlap_50pct",
+      "nperseg": 128,
+      "noverlap": 64,
+      "nfft": 512,
+      "error": "'lr'"
+    },
+    {
+      "task": "SSVEP",
+      "config_name": "overlap_75pct",
+      "nperseg": 128,
+      "noverlap": 96,
+      "nfft": 512,
+      "error": "'lr'"
+    },
+    {
+      "task": "SSVEP",
+      "config_name": "overlap_93pct",
+      "nperseg": 128,
+      "noverlap": 120,
+      "nfft": 512,
+      "error": "'lr'"
+    },
+    {
+      "task": "SSVEP",
+      "config_name": "nfft_256",
+      "nperseg": 128,
+      "noverlap": 112,
+      "nfft": 256,
+      "error": "'lr'"
+    },
+    {
+      "task": "SSVEP",
+      "config_name": "nfft_1024",
+      "nperseg": 128,
+      "noverlap": 112,
+      "nfft": 1024,
+      "error": "'lr'"
+    },
+    {
+      "task": "SSVEP",
+      "config_name": "nfft_2048",
+      "nperseg": 128,
+      "noverlap": 112,
+      "nfft": 2048,
+      "error": "'lr'"
+    },
+    {
+      "task": "SSVEP",
+      "config_name": "high_time_res",
+      "nperseg": 64,
+      "noverlap": 56,
+      "nfft": 512,
+      "error": "'lr'"
+    },
+    {
+      "task": "SSVEP",
+      "config_name": "high_freq_res",
+      "nperseg": 128,
+      "noverlap": 112,
+      "nfft": 2048,
+      "error": "'lr'"
+    },
+    {
+      "task": "SSVEP",
+      "config_name": "balanced",
+      "nperseg": 128,
+      "noverlap": 96,
+      "nfft": 1024,
+      "error": "'lr'"
+    }
+  ]
+}

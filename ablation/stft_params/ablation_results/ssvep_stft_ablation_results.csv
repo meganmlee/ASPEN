@@ -1,0 +1,12 @@
+task,config_name,nperseg,noverlap,nfft,error
+SSVEP,default,128,112,512,'lr'
+SSVEP,nperseg_64,64,56,512,'lr'
+SSVEP,overlap_50pct,128,64,512,'lr'
+SSVEP,overlap_75pct,128,96,512,'lr'
+SSVEP,overlap_93pct,128,120,512,'lr'
+SSVEP,nfft_256,128,112,256,'lr'
+SSVEP,nfft_1024,128,112,1024,'lr'
+SSVEP,nfft_2048,128,112,2048,'lr'
+SSVEP,high_time_res,64,56,512,'lr'
+SSVEP,high_freq_res,128,112,2048,'lr'
+SSVEP,balanced,128,96,1024,'lr'
