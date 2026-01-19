@@ -599,7 +599,7 @@ def train_all_tasks(tasks: Optional[list] = None, save_dir: str = './checkpoints
         Dictionary of results for each task
     """
     if tasks is None:
-        tasks = ['SSVEP', 'P300', 'MI', 'Imagined_speech', 'Lee2019_MI', 'Lee2019_SSVEP', 'BNCI2014_P300']
+        tasks = ['SSVEP', 'P300', 'MI', 'Imagined_speech', 'Lee2019_MI', 'Lee2019_SSVEP', 'BNCI2014_P300', 'BI2014b_P300']
     
     os.makedirs(save_dir, exist_ok=True)
     
@@ -666,7 +666,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description='Train ChannelWiseSpectralCLDNN on EEG tasks')
     parser.add_argument('--task', type=str, default='SSVEP',
-                        choices=['SSVEP', 'P300', 'MI', 'Imagined_speech', 'Lee2019_MI', 'Lee2019_SSVEP', 'BNCI2014_P300', 'all'],
+                        choices=['SSVEP', 'P300', 'MI', 'Imagined_speech', 'Lee2019_MI', 'Lee2019_SSVEP', 'BNCI2014_P300', 'BI2014b_P300', 'all'],
                         help='Task to train on (default: SSVEP)')
     parser.add_argument('--save_dir', type=str, default='./checkpoints',
                         help='Directory to save model checkpoints')
