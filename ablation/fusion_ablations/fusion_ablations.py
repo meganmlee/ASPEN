@@ -15,7 +15,7 @@ import mne
 # ==================== Path Setup ====================
 current_dir = os.path.dirname(os.path.abspath(__file__))
 # Moves up from ablation/fusion_ablations/ to ablation/, then up to root, then into scale_net
-scale_net_path = os.path.abspath(os.path.join(current_dir, '..', '..', 'scale_net'))
+scale_net_path = os.path.abspath(os.path.join(current_dir, '..', '..', 'scale-net'))
 
 if scale_net_path not in sys.path:
     sys.path.insert(0, scale_net_path)
@@ -398,6 +398,17 @@ def plot_spatial_attention_heatmap(task, stats, n_channels):
 # ==================== Ablation Study ====================
 
 def run_ablation_study(task: str, config: Dict = None):
+    """
+    Run fusion strategy ablation study for a given task.
+    
+    Args:
+        task: Task name (e.g., 'SSVEP', 'P300', 'MI', etc.)
+        config: Configuration dictionary. Can include:
+            - Training params: 'num_epochs', 'batch_size', 'lr', 'seed', 'patience'
+            - Model params: 'cnn_filters', 'lstm_hidden', 'pos_dim', 'dropout', etc.
+            - STFT params (optional): 'stft_fs', 'stft_nperseg', 'stft_noverlap', 'stft_nfft'
+                If not provided, uses default values from TASK_CONFIGS for the task.
+    """
     strategies = ['spatial_attention', 'static', 'global_attention', 'glu', 'multiplicative', 'bilinear']
     if config is None:
         config = {
@@ -407,7 +418,8 @@ def run_ablation_study(task: str, config: Dict = None):
         }
 
     train_keys = {'num_epochs', 'batch_size', 'lr', 'seed', 'weight_decay', 'patience'}
-    model_kwargs = {k: v for k, v in config.items() if k not in train_keys}
+    stft_keys = {'stft_fs', 'stft_nperseg', 'stft_noverlap', 'stft_nfft', 'sampling_rate'}
+    model_kwargs = {k: v for k, v in config.items() if k not in train_keys and k not in stft_keys}
 
     task_config = TASK_CONFIGS.get(task, {})
     patience = config.get('patience', 5)
@@ -421,7 +433,14 @@ def run_ablation_study(task: str, config: Dict = None):
         seed_everything(config['seed'], deterministic=True)
         
         datasets = load_dataset(task=task, data_dir=task_config.get('data_dir'), seed=config['seed'])
-        stft_config = {k: task_config.get(v) for k, v in [('fs','sampling_rate'), ('nperseg','stft_nperseg'), ('noverlap','stft_noverlap'), ('nfft','stft_nfft')]}
+        
+        # STFT config: Use custom values from config if provided, otherwise use task_config defaults
+        stft_config = {
+            'fs': config.get('stft_fs') or config.get('sampling_rate') or task_config.get('sampling_rate', 250),
+            'nperseg': config.get('stft_nperseg', task_config.get('stft_nperseg', 128)),
+            'noverlap': config.get('stft_noverlap', task_config.get('stft_noverlap', 112)),
+            'nfft': config.get('stft_nfft', task_config.get('stft_nfft', 512))
+        }
         loaders = create_dataloaders(datasets, stft_config, batch_size=config['batch_size'])
         
         sample_x, _ = next(iter(loaders['train']))
@@ -484,6 +503,15 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=1e-3)
+    # STFT configuration parameters (optional - uses task defaults if not specified)
+    parser.add_argument('--stft_fs', type=int, default=None, 
+                        help='STFT sampling frequency (Hz). If not specified, uses task default.')
+    parser.add_argument('--stft_nperseg', type=int, default=None,
+                        help='STFT window length (nperseg). If not specified, uses task default.')
+    parser.add_argument('--stft_noverlap', type=int, default=None,
+                        help='STFT overlap length (noverlap). If not specified, uses task default.')
+    parser.add_argument('--stft_nfft', type=int, default=None,
+                        help='STFT FFT length (nfft). If not specified, uses task default.')
     
     args = parser.parse_args()
     
@@ -504,5 +532,15 @@ if __name__ == "__main__":
         'hidden_dim': 64,
         'patience': 5,
     }
+    
+    # Add STFT config if provided (None values will use task defaults)
+    if args.stft_fs is not None:
+        experiment_config['sampling_rate'] = args.stft_fs
+    if args.stft_nperseg is not None:
+        experiment_config['stft_nperseg'] = args.stft_nperseg
+    if args.stft_noverlap is not None:
+        experiment_config['stft_noverlap'] = args.stft_noverlap
+    if args.stft_nfft is not None:
+        experiment_config['stft_nfft'] = args.stft_nfft
     
     run_ablation_study(args.task, experiment_config)
