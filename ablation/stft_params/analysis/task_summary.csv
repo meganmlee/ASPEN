@@ -1,2 +1,0 @@
-task,total_configs,successful_configs,best_val_acc,best_test1_acc,best_test2_acc,best_config_name,best_nperseg,best_noverlap,best_nfft
-SSVEP,12,12,86.36363636363636,,,nperseg64_overlap50pct_nfft1024,64,32,1024

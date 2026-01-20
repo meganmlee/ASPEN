@@ -1,12 +1,19 @@
 """
-STFT Parameters Ablation Study for Adaptive SCALE-Net
+STFT 27-Config Ablation Study for Adaptive SCALE-Net
 
-This script performs ablation study by varying STFT parameters (nperseg, noverlap, nfft)
-and evaluates the impact on model accuracy for each task.
+This script performs systematic ablation study by testing a fixed 3×3×3 = 27 settings
+of STFT parameters (nperseg, noverlap, nfft) to find optimal configurations.
+
+Each parameter has 3 values:
+- nperseg: [min, default, max]
+- overlap_ratio: [0.5, 0.75, 0.9375]
+- nfft: [small, default, large]
+
+Total: 3 × 3 × 3 = 27 settings
 
 Usage:
-    python ablation_stft.py --task SSVEP --save_dir ./ablation_results
-    python ablation_stft.py --task all --save_dir ./ablation_results
+    python ablation_stft.py --task SSVEP
+    python ablation_stft.py --task all
 """
 
 import os
@@ -22,33 +29,32 @@ scale_net_path = os.path.join(os.path.dirname(__file__), '..', '..', 'scale-net'
 sys.path.insert(0, scale_net_path)
 
 # Import from scale-net
-from scale_net_adaptive import train_task
+from train_scale_net import train_task
 from dataset import TASK_CONFIGS
 
 
-# ==================== STFT Parameter Configurations ====================
+# ==================== STFT 27-Config Generation ====================
 
-def get_stft_param_grid(task: str) -> List[Dict]:
+def get_stft_param_settings(task: str) -> List[Dict]:
     """
-    Generate STFT parameter grid for a given task
+    Generate fixed 3×3×3 = 27 STFT parameter settings for a given task
     
     Args:
         task: Task name
         
     Returns:
-        List of STFT parameter configurations to test
+        List of 27 STFT parameter configurations to test
     """
     task_config = TASK_CONFIGS.get(task, {})
     sampling_rate = task_config.get('sampling_rate', 250)
     
     # Estimate typical input length based on task
-    # This is approximate - actual length may vary
     typical_input_lengths = {
         'SSVEP': 250,
-        'Lee2019_SSVEP': 1000,  # From preprocessing
+        'Lee2019_SSVEP': 1000,
         'P300': 256,
         'BNCI2014_P300': 512,
-        'MI': 1000,  # 4 seconds at 250 Hz
+        'MI': 1000,
         'Lee2019_MI': 1000,
         'Imagined_speech': 1000,
     }
@@ -59,127 +65,92 @@ def get_stft_param_grid(task: str) -> List[Dict]:
     default_noverlap = task_config.get('stft_noverlap', 112)
     default_nfft = task_config.get('stft_nfft', 512)
     
-    # Define parameter variations
-    # nperseg: window size in samples (affects time resolution)
-    # Smaller nperseg = better time resolution, worse frequency resolution
-    # Larger nperseg = worse time resolution, better frequency resolution
-    nperseg_options = []
-    
-    # For different sampling rates, adjust nperseg options
-    # But ensure nperseg <= max_input_length
+    # Define parameter ranges
     if sampling_rate <= 256:
-        nperseg_options = [64, 128, 256]
-        nperseg_options = [n for n in nperseg_options if n <= max_input_length]
+        nperseg_options = [n for n in [64, 128, 256] if n <= max_input_length]
         if 512 <= max_input_length:
             nperseg_options.append(512)
     elif sampling_rate <= 512:
-        nperseg_options = [128, 256, 512]
-        nperseg_options = [n for n in nperseg_options if n <= max_input_length]
+        nperseg_options = [n for n in [128, 256, 512] if n <= max_input_length]
         if 1024 <= max_input_length:
             nperseg_options.append(1024)
     else:  # 1000 Hz
-        nperseg_options = [256, 512, 1024]
-        nperseg_options = [n for n in nperseg_options if n <= max_input_length]
+        nperseg_options = [n for n in [256, 512, 1024] if n <= max_input_length]
         if 2048 <= max_input_length:
             nperseg_options.append(2048)
     
-    # noverlap: overlap in samples (affects time resolution)
-    # Higher overlap = smoother time resolution, more computation
-    # Typical values: 50%, 75%, 87.5%, 93.75% of nperseg
-    overlap_ratios = [0.5, 0.75, 0.875, 0.9375]
+    # Select 3 nperseg values: min, default, max
+    nperseg_values = []
+    if len(nperseg_options) == 1:
+        nperseg_values = nperseg_options
+    elif len(nperseg_options) == 2:
+        nperseg_values = nperseg_options
+    else:
+        nperseg_values = [
+            min(nperseg_options),
+            default_nperseg if default_nperseg in nperseg_options else nperseg_options[len(nperseg_options)//2],
+            max([n for n in nperseg_options if n <= max_input_length])
+        ]
+        # Remove duplicates and sort
+        nperseg_values = sorted(list(set(nperseg_values)))
+        # Ensure we have exactly 3
+        if len(nperseg_values) > 3:
+            nperseg_values = [nperseg_values[0], nperseg_values[len(nperseg_values)//2], nperseg_values[-1]]
     
-    # nfft: FFT size (affects frequency resolution)
-    # Larger nfft = better frequency resolution, more computation
-    # Should be >= nperseg, typically power of 2
+    # Select 3 overlap ratios: low (0.5), medium (0.75), high (0.9375)
+    overlap_values = [0.5, 0.75, 0.9375]
+    
+    # Select 3 nfft values: small, default, large
     nfft_options = [256, 512, 1024, 2048]
+    nfft_values = []
+    if default_nfft in nfft_options:
+        # Find indices around default
+        default_idx = nfft_options.index(default_nfft)
+        if default_idx == 0:
+            nfft_values = [nfft_options[0], nfft_options[1], nfft_options[2]]
+        elif default_idx == len(nfft_options) - 1:
+            nfft_values = [nfft_options[-3], nfft_options[-2], nfft_options[-1]]
+        else:
+            nfft_values = [nfft_options[default_idx-1], nfft_options[default_idx], nfft_options[default_idx+1]]
+    else:
+        # Default not in options, use first 3
+        nfft_values = nfft_options[:3]
     
-    # Generate parameter combinations
-    param_grid = []
+    # Generate all 3×3×3 = 27 settings
+    selected = []
+    for nperseg in nperseg_values:
+        for overlap_ratio in overlap_values:
+            noverlap = int(nperseg * overlap_ratio)
+            if noverlap >= nperseg:
+                continue  # Skip invalid
+            
+            for nfft in nfft_values:
+                if nfft < nperseg:
+                    continue  # Skip invalid
+                
+                selected.append({
+                    'nperseg': nperseg,
+                    'noverlap': noverlap,
+                    'nfft': nfft,
+                    'overlap_ratio': overlap_ratio,
+                })
     
-    # Add default configuration first
-    param_grid.append({
-        'nperseg': default_nperseg,
-        'noverlap': default_noverlap,
-        'nfft': default_nfft,
-        'name': 'default'
-    })
+    # Add names to configurations
+    for idx, cfg in enumerate(selected):
+        cfg['name'] = f"nperseg{cfg['nperseg']}_overlap{int(cfg['overlap_ratio']*100)}pct_nfft{cfg['nfft']}"
     
-    # Vary nperseg (keep default overlap ratio and nfft)
-    default_overlap_ratio = default_noverlap / default_nperseg if default_nperseg > 0 else 0.875
-    for nperseg in nperseg_options:
-        if nperseg != default_nperseg:
-            noverlap = int(nperseg * default_overlap_ratio)
-            nfft = max(nperseg, default_nfft)  # nfft should be >= nperseg
-            # Round nfft to nearest power of 2 >= nperseg
-            nfft = 2 ** (int(nfft).bit_length() - 1) if nfft > nperseg else 2 ** (nperseg.bit_length() - 1)
-            param_grid.append({
-                'nperseg': nperseg,
-                'noverlap': noverlap,
-                'nfft': nfft,
-                'name': f'nperseg_{nperseg}'
-            })
+    print(f"Generated {len(selected)} settings (3×3×3 grid)")
     
-    # Vary overlap ratio (keep default nperseg and nfft)
-    for overlap_ratio in overlap_ratios:
-        if abs(overlap_ratio - default_overlap_ratio) > 0.01:
-            noverlap = int(default_nperseg * overlap_ratio)
-            param_grid.append({
-                'nperseg': default_nperseg,
-                'noverlap': noverlap,
-                'nfft': default_nfft,
-                'name': f'overlap_{int(overlap_ratio*100)}pct'
-            })
-    
-    # Vary nfft (keep default nperseg and overlap)
-    for nfft in nfft_options:
-        if nfft != default_nfft and nfft >= default_nperseg:
-            param_grid.append({
-                'nperseg': default_nperseg,
-                'noverlap': default_noverlap,
-                'nfft': nfft,
-                'name': f'nfft_{nfft}'
-            })
-    
-    # Add a few combined variations
-    # High time resolution (small nperseg, high overlap)
-    small_nperseg = min(nperseg_options)
-    param_grid.append({
-        'nperseg': small_nperseg,
-        'noverlap': int(small_nperseg * 0.875),
-        'nfft': max(512, 2 ** (small_nperseg.bit_length() - 1)),
-        'name': 'high_time_res'
-    })
-    
-    # High frequency resolution (large nperseg, large nfft)
-    large_nperseg = max(nperseg_options)
-    large_nfft = max(nfft_options)
-    param_grid.append({
-        'nperseg': large_nperseg,
-        'noverlap': int(large_nperseg * 0.875),
-        'nfft': large_nfft,
-        'name': 'high_freq_res'
-    })
-    
-    # Balanced (medium nperseg, medium overlap, medium nfft)
-    mid_nperseg = nperseg_options[len(nperseg_options) // 2]
-    mid_nfft = nfft_options[len(nfft_options) // 2]
-    param_grid.append({
-        'nperseg': mid_nperseg,
-        'noverlap': int(mid_nperseg * 0.75),
-        'nfft': mid_nfft,
-        'name': 'balanced'
-    })
-    
-    return param_grid
+    return selected
 
 
 # ==================== Ablation Study ====================
 
-def run_ablation(task: str, save_dir: str = './ablation_results', 
-                 epochs: int = 50, batch_size: int = 16, 
-                 seed: int = 44, verbose: bool = True) -> Dict:
+def run_ablation(task: str, save_dir: str = './ablation_results',
+                             epochs: int = 30, batch_size: int = 16,
+                             seed: int = 44, verbose: bool = True) -> Dict:
     """
-    Run STFT parameter ablation study for a task
+    Run STFT parameter ablation study for a task (fixed 3×3×3 = 27 settings)
     
     Args:
         task: Task name
@@ -193,7 +164,8 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
         Dictionary with results for all parameter configurations
     """
     print(f"\n{'='*80}")
-    print(f"STFT Parameter Ablation Study: {task}")
+    print(f"STFT 27-Config Ablation Study: {task}")
+    print(f"3×3×3 = 27 settings")
     print(f"{'='*80}")
     
     task_config = TASK_CONFIGS.get(task, {})
@@ -203,69 +175,55 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
     sampling_rate = task_config.get('sampling_rate', 250)
     print(f"Sampling Rate: {sampling_rate} Hz")
     
-    # Get parameter grid
-    param_grid = get_stft_param_grid(task)
-    print(f"\nTesting {len(param_grid)} STFT parameter configurations...")
+    # Get parameter settings (always 27)
+    param_settings = get_stft_param_settings(task)
+    print(f"\nTesting {len(param_settings)} STFT parameter settings...")
+    
+    # Print all settings that will be tested
+    print(f"\n{'='*80}")
+    print(f"STFT PARAMETER SETTINGS TO TEST (27 settings):")
+    print(f"{'='*80}")
+    for idx, cfg in enumerate(param_settings, 1):
+        print(f"{idx:3d}. {cfg['name']}")
+        print(f"     nperseg={cfg['nperseg']:4d}, noverlap={cfg['noverlap']:4d}, nfft={cfg['nfft']:4d}, "
+              f"overlap={cfg['overlap_ratio']*100:5.1f}%")
+    print(f"{'='*80}")
+    
+    # Estimate time
+    estimated_hours = len(param_settings) * epochs / 60  # Rough estimate
+    print(f"Estimated time: ~{estimated_hours:.1f} hours (assuming {epochs} epochs per config)")
+    print(f"{'='*80}")
     
     results = []
     best_acc = 0.0
     best_config = None
     
-    for idx, stft_params in enumerate(param_grid, 1):
+    for idx, stft_params in enumerate(param_settings, 1):
         nperseg = stft_params['nperseg']
         noverlap = stft_params['noverlap']
         nfft = stft_params['nfft']
         name = stft_params['name']
+        overlap_ratio = stft_params['overlap_ratio']
         
-        # Estimate typical input length based on task
-        typical_input_lengths = {
-            'SSVEP': 250,
-            'Lee2019_SSVEP': 1000,
-            'P300': 256,
-            'BNCI2014_P300': 512,
-            'MI': 1000,
-            'Lee2019_MI': 1000,
-            'Imagined_speech': 1000,
-        }
-        max_input_length = typical_input_lengths.get(task, 250)
+        # Validate parameters
+        if noverlap >= nperseg:
+            noverlap = max(1, nperseg - 1)
         
-        # Ensure nperseg doesn't exceed typical input length
-        # If nperseg is too large, scipy will auto-adjust, but we want to avoid that
-        if nperseg > max_input_length:
-            print(f"  Warning: nperseg {nperseg} may be too large for input length ({max_input_length}), skipping...")
-            results.append({
-                'task': task,
-                'config_name': name,
-                'nperseg': nperseg,
-                'noverlap': noverlap,
-                'nfft': nfft,
-                'error': f'nperseg {nperseg} too large for typical input length {max_input_length}'
-            })
-            continue
-        
-        # Ensure nfft >= nperseg
         if nfft < nperseg:
             nfft = 2 ** (nperseg.bit_length() - 1)
             if nfft < nperseg:
                 nfft = 2 ** nperseg.bit_length()
         
-        # Ensure noverlap < nperseg (strictly less)
-        if noverlap >= nperseg:
-            noverlap = max(1, int(nperseg * 0.875))
-        
-        # Final validation
-        if noverlap >= nperseg:
-            noverlap = nperseg - 1
-        
         print(f"\n{'-'*80}")
-        print(f"Configuration {idx}/{len(param_grid)}: {name}")
+        print(f"Configuration {idx}/{len(param_settings)}: {name}")
         print(f"  nperseg: {nperseg} ({nperseg/sampling_rate:.3f} sec)")
-        print(f"  noverlap: {noverlap} ({100*noverlap/nperseg:.1f}% overlap)")
+        print(f"  noverlap: {noverlap} ({overlap_ratio*100:.1f}% overlap)")
         print(f"  nfft: {nfft}")
         print(f"  Frequency resolution: {sampling_rate/nfft:.2f} Hz/bin")
+        print(f"  Time resolution: {(nperseg-noverlap)/sampling_rate:.3f} sec/step")
         print(f"{'-'*80}")
         
-        # Create config for training with all required parameters
+        # Create config for training
         config = {
             'seed': seed,
             'batch_size': batch_size,
@@ -274,7 +232,7 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
             'stft_nperseg': nperseg,
             'stft_noverlap': noverlap,
             'stft_nfft': nfft,
-            # Model parameters (using defaults from scale_net_adaptive.py)
+            # Model parameters
             'cnn_filters': 16,
             'lstm_hidden': 128,
             'pos_dim': 16,
@@ -282,22 +240,22 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
             'cnn_dropout': 0.2,
             'use_hidden_layer': False,
             'hidden_dim': 64,
-            # Training parameters (using defaults from scale_net_adaptive.py)
+            # Training parameters
             'lr': 1e-3,
             'weight_decay': 1e-4,
-            'patience': 20,
+            'patience': 5,
             'scheduler': 'ReduceLROnPlateau',
         }
         
-        # Create unique model path for this configuration
+        # Create unique model path
         model_path = os.path.join(
-            save_dir, 
+            save_dir,
             f'{task.lower()}_stft_{name}_model.pth'
         )
         os.makedirs(save_dir, exist_ok=True)
         
         try:
-            # Train model with this STFT configuration
+            # Train model
             model, train_results = train_task(
                 task=task,
                 config=config,
@@ -311,13 +269,23 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
                 'nperseg': nperseg,
                 'noverlap': noverlap,
                 'nfft': nfft,
-                'overlap_ratio': noverlap / nperseg,
+                'overlap_ratio': overlap_ratio,
                 'time_resolution_sec': nperseg / sampling_rate,
+                'time_step_sec': (nperseg - noverlap) / sampling_rate,
                 'freq_resolution_hz': sampling_rate / nfft,
                 'val_acc': train_results.get('val', 0.0),
+                'val_f1': train_results.get('val_f1', None),
+                'val_recall': train_results.get('val_recall', None),
+                'val_auc': train_results.get('val_auc', None),
                 'test1_acc': train_results.get('test1', 0.0),
-                'test2_acc': train_results.get('test2', 0.0),
+                'test1_f1': train_results.get('test1_f1', None),
+                'test1_recall': train_results.get('test1_recall', None),
+                'test1_auc': train_results.get('test1_auc', None),
                 'test1_loss': train_results.get('test1_loss', None),
+                'test2_acc': train_results.get('test2', 0.0),
+                'test2_f1': train_results.get('test2_f1', None),
+                'test2_recall': train_results.get('test2_recall', None),
+                'test2_auc': train_results.get('test2_auc', None),
                 'test2_loss': train_results.get('test2_loss', None),
             }
             
@@ -332,10 +300,32 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
             if verbose:
                 print(f"\n✓ Configuration {name} completed:")
                 print(f"  Val Acc: {result['val_acc']:.2f}%")
+                if result.get('val_f1') is not None:
+                    print(f"  Val F1: {result['val_f1']:.2f}%, Recall: {result['val_recall']:.2f}%", end="")
+                    if result.get('val_auc') is not None:
+                        print(f", AUC: {result['val_auc']:.2f}%")
+                    else:
+                        print()
                 if result['test1_acc']:
-                    print(f"  Test1 Acc: {result['test1_acc']:.2f}%")
+                    print(f"  Test1 Acc: {result['test1_acc']:.2f}%", end="")
+                    if result.get('test1_f1') is not None:
+                        print(f" (F1: {result['test1_f1']:.2f}%, Recall: {result['test1_recall']:.2f}%", end="")
+                        if result.get('test1_auc') is not None:
+                            print(f", AUC: {result['test1_auc']:.2f}%)")
+                        else:
+                            print(")")
+                    else:
+                        print()
                 if result['test2_acc']:
-                    print(f"  Test2 Acc: {result['test2_acc']:.2f}%")
+                    print(f"  Test2 Acc: {result['test2_acc']:.2f}%", end="")
+                    if result.get('test2_f1') is not None:
+                        print(f" (F1: {result['test2_f1']:.2f}%, Recall: {result['test2_recall']:.2f}%", end="")
+                        if result.get('test2_auc') is not None:
+                            print(f", AUC: {result['test2_auc']:.2f}%)")
+                        else:
+                            print(")")
+                    else:
+                        print()
         
         except Exception as e:
             print(f"\n✗ Configuration {name} failed: {e}")
@@ -352,51 +342,86 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
     
     # Save results
     results_df = pd.DataFrame(results)
-    results_file = os.path.join(save_dir, f'{task.lower()}_stft_ablation_results.csv')
+    results_file = os.path.join(save_dir, f'{task.lower()}_stft_27_results.csv')
     results_df.to_csv(results_file, index=False)
     print(f"\n✓ Results saved to: {results_file}")
+    
+    # Sort by validation accuracy
+    successful_results = [r for r in results if 'error' not in r]
+    if successful_results:
+        successful_results.sort(key=lambda x: x['val_acc'], reverse=True)
+        
+        # Save top 10 configurations
+        top10_file = os.path.join(save_dir, f'{task.lower()}_stft_27_top10.csv')
+        top10_df = pd.DataFrame(successful_results[:10])
+        top10_df.to_csv(top10_file, index=False)
+        print(f"✓ Top 10 configurations saved to: {top10_file}")
     
     # Save summary
     summary = {
         'task': task,
         'sampling_rate': sampling_rate,
-        'total_configs': len(param_grid),
-        'successful_configs': len([r for r in results if 'error' not in r]),
+        'total_configs': len(param_settings),
+        'successful_configs': len(successful_results),
         'best_config': best_config,
+        'top10_configs': successful_results[:10] if successful_results else [],
         'all_results': results
     }
     
-    summary_file = os.path.join(save_dir, f'{task.lower()}_stft_ablation_summary.json')
+    summary_file = os.path.join(save_dir, f'{task.lower()}_stft_27_summary.json')
     with open(summary_file, 'w') as f:
         json.dump(summary, f, indent=2)
     print(f"✓ Summary saved to: {summary_file}")
     
-    # Print best configuration
-    if best_config:
+    # Print best configurations
+    if successful_results:
         print(f"\n{'='*80}")
-        print(f"BEST STFT CONFIGURATION for {task}:")
+        print(f"TOP 5 STFT CONFIGURATIONS for {task}:")
         print(f"{'='*80}")
-        print(f"  Name: {best_config['config_name']}")
-        print(f"  nperseg: {best_config['nperseg']} ({best_config['time_resolution_sec']:.3f} sec)")
-        print(f"  noverlap: {best_config['noverlap']} ({best_config['overlap_ratio']*100:.1f}% overlap)")
-        print(f"  nfft: {best_config['nfft']}")
-        print(f"  Frequency resolution: {best_config['freq_resolution_hz']:.2f} Hz/bin")
-        print(f"  Validation Accuracy: {best_config['val_acc']:.2f}%")
-        if best_config['test1_acc']:
-            print(f"  Test1 Accuracy: {best_config['test1_acc']:.2f}%")
-        if best_config['test2_acc']:
-            print(f"  Test2 Accuracy: {best_config['test2_acc']:.2f}%")
+        for rank, result in enumerate(successful_results[:5], 1):
+            print(f"\nRank {rank}: {result['config_name']}")
+            print(f"  nperseg: {result['nperseg']}, noverlap: {result['noverlap']}, nfft: {result['nfft']}")
+            print(f"  Overlap: {result['overlap_ratio']*100:.1f}%, Time step: {result['time_step_sec']:.3f}s")
+            print(f"  Val Acc: {result['val_acc']:.2f}%", end="")
+        if result.get('val_f1') is not None:
+            print(f" | F1: {result['val_f1']:.2f}%, Recall: {result['val_recall']:.2f}%", end="")
+            if result.get('val_auc') is not None:
+                print(f", AUC: {result['val_auc']:.2f}%")
+            else:
+                print()
+        else:
+            print()
+        if result['test1_acc']:
+            print(f"  Test1 Acc: {result['test1_acc']:.2f}%", end="")
+            if result.get('test1_f1') is not None:
+                print(f" | F1: {result['test1_f1']:.2f}%, Recall: {result['test1_recall']:.2f}%", end="")
+                if result.get('test1_auc') is not None:
+                    print(f", AUC: {result['test1_auc']:.2f}%")
+                else:
+                    print()
+            else:
+                print()
+        if result['test2_acc']:
+            print(f"  Test2 Acc: {result['test2_acc']:.2f}%", end="")
+            if result.get('test2_f1') is not None:
+                print(f" | F1: {result['test2_f1']:.2f}%, Recall: {result['test2_recall']:.2f}%", end="")
+                if result.get('test2_auc') is not None:
+                    print(f", AUC: {result['test2_auc']:.2f}%")
+                else:
+                    print()
+            else:
+                print()
         print(f"{'='*80}")
     
     return summary
 
 
-def run_all_tasks_ablation(tasks: Optional[List[str]] = None, 
-                          save_dir: str = './ablation_results',
-                          epochs: int = 50, batch_size: int = 16,
-                          seed: int = 44) -> Dict:
+def run_all_tasks_ablation(tasks: Optional[List[str]] = None,
+                               save_dir: str = './ablation_results',
+                               epochs: int = 50, batch_size: int = 16,
+                               seed: int = 44) -> Dict:
     """
-    Run STFT ablation study for all tasks
+    Run STFT ablation study for all tasks (27 settings per task)
     
     Args:
         tasks: List of tasks (default: all tasks in TASK_CONFIGS)
@@ -414,11 +439,12 @@ def run_all_tasks_ablation(tasks: Optional[List[str]] = None,
     all_results = {}
     
     print(f"\n{'='*80}")
-    print(f"STFT Parameter Ablation Study - All Tasks")
+    print(f"STFT 27-Config Ablation Study - All Tasks")
+    print(f"3×3×3 = 27 settings per task")
     print(f"{'='*80}")
     print(f"Tasks: {tasks}")
-    print(f"Total configurations per task: ~15-20")
-    print(f"Estimated time: ~{len(tasks) * 20 * epochs / 60:.1f} minutes (assuming {epochs} epochs per config)")
+    print(f"Configurations per task: 27")
+    print(f"Estimated time: ~{len(tasks) * 27 * epochs / 60:.1f} hours")
     print(f"{'='*80}")
     
     for task in tasks:
@@ -444,10 +470,11 @@ def run_all_tasks_ablation(tasks: Optional[List[str]] = None,
         'epochs_per_config': epochs,
         'batch_size': batch_size,
         'seed': seed,
+        'configs_per_task': 27,
         'results': all_results
     }
     
-    summary_file = os.path.join(save_dir, 'all_tasks_stft_ablation_summary.json')
+    summary_file = os.path.join(save_dir, 'all_tasks_stft_27_summary.json')
     with open(summary_file, 'w') as f:
         json.dump(overall_summary, f, indent=2)
     print(f"\n✓ Overall summary saved to: {summary_file}")
@@ -459,14 +486,38 @@ def run_all_tasks_ablation(tasks: Optional[List[str]] = None,
     for task, result in all_results.items():
         if 'error' not in result and 'best_config' in result:
             best = result['best_config']
-            print(f"\n{task}:")
-            print(f"  Config: {best['config_name']}")
-            print(f"  Params: nperseg={best['nperseg']}, noverlap={best['noverlap']}, nfft={best['nfft']}")
-            print(f"  Val Acc: {best['val_acc']:.2f}%")
-            if best.get('test1_acc'):
-                print(f"  Test1 Acc: {best['test1_acc']:.2f}%")
-            if best.get('test2_acc'):
-                print(f"  Test2 Acc: {best['test2_acc']:.2f}%")
+        print(f"\n{task}:")
+        print(f"  Config: {best['config_name']}")
+        print(f"  Params: nperseg={best['nperseg']}, noverlap={best['noverlap']}, nfft={best['nfft']}")
+        print(f"  Val Acc: {best['val_acc']:.2f}%", end="")
+        if best.get('val_f1') is not None:
+            print(f" | F1: {best['val_f1']:.2f}%, Recall: {best['val_recall']:.2f}%", end="")
+            if best.get('val_auc') is not None:
+                print(f", AUC: {best['val_auc']:.2f}%")
+            else:
+                print()
+        else:
+            print()
+        if best.get('test1_acc'):
+            print(f"  Test1 Acc: {best['test1_acc']:.2f}%", end="")
+            if best.get('test1_f1') is not None:
+                print(f" | F1: {best['test1_f1']:.2f}%, Recall: {best['test1_recall']:.2f}%", end="")
+                if best.get('test1_auc') is not None:
+                    print(f", AUC: {best['test1_auc']:.2f}%")
+                else:
+                    print()
+            else:
+                print()
+        if best.get('test2_acc'):
+            print(f"  Test2 Acc: {best['test2_acc']:.2f}%", end="")
+            if best.get('test2_f1') is not None:
+                print(f" | F1: {best['test2_f1']:.2f}%, Recall: {best['test2_recall']:.2f}%", end="")
+                if best.get('test2_auc') is not None:
+                    print(f", AUC: {best['test2_auc']:.2f}%")
+                else:
+                    print()
+            else:
+                print()
         else:
             print(f"\n{task}: FAILED")
     print(f"{'='*80}")
@@ -476,7 +527,7 @@ def run_all_tasks_ablation(tasks: Optional[List[str]] = None,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description='STFT Parameter Ablation Study for Adaptive SCALE-Net'
+        description='STFT 27-Config Ablation Study for Adaptive SCALE-Net (3×3×3 = 27 settings)'
     )
     
     parser.add_argument(

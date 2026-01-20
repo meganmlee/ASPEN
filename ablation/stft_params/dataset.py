@@ -67,16 +67,6 @@ TASK_CONFIGS = {
         "stft_noverlap": 240,
         "stft_nfft": 512,
     },
-    "EPFL_P300": {
-        "num_classes": 2,
-        "num_subjects": 8,
-        "num_seen": 6,
-        "data_dir": "/ocean/projects/cis250213p/shared/epfl_p300",
-        "sampling_rate": 256,
-        "stft_nperseg": 256,
-        "stft_noverlap": 240,
-        "stft_nfft": 512,
-    },
     "BI2014b_P300": {
         "num_classes": 2,
         "num_subjects": 38,
@@ -594,69 +584,6 @@ def load_bnci_p300(data_dir: str, num_seen: int = 7, seed: int = 44) -> Dict:
 
     return result
 
-def load_epfl_p300(data_dir: str, num_seen: int = 6, seed: int = 44) -> Dict:
-    """
-    Load EPFL P300 data with subject splitting.
-    Available Subjects: [1, 2, 3, 4, 6, 7, 8, 9] (8 subjects total)
-    """
-    # Explicitly define subjects based on folder structure
-    all_subjects = [1, 2, 3, 4, 6, 7, 8, 9] 
-    random.seed(seed)
-    np.random.seed(seed)
-    
-    # Subject-level split: Seen subjects vs. entirely Unseen subjects
-    seen_subjects = random.sample(all_subjects, num_seen)
-    unseen_subjects = [s for s in all_subjects if s not in seen_subjects]
-
-    print(f"[EPFL_P300] Loading from: {data_dir}")
-    print(f"[EPFL_P300] Seen subjects (Internal Split): {seen_subjects}")
-    print(f"[EPFL_P300] Unseen subjects (Entirely New): {unseen_subjects}")
-
-    X_train, y_train = [], []
-    X_val, y_val = [], []
-    X_test1, y_test1 = [], [] 
-    X_test2, y_test2 = [], []
-
-    # Process SEEN subjects: Split their trials into Train/Val/Test1 (60/20/20)
-    for sid in seen_subjects:
-        file_path = os.path.join(data_dir, f"S{sid}_preprocessed.npz")
-        if not os.path.exists(file_path):
-            print(f"  [WARNING] File not found for Subject {sid}: {file_path}")
-            continue
-            
-        with np.load(file_path) as data:
-            X, y = data['X'], data['y']
-            
-            t_idx = int(len(X) * 0.6)
-            v_idx = int(len(X) * 0.8)
-            
-            X_train.append(X[:t_idx])
-            y_train.append(y[:t_idx])
-            X_val.append(X[t_idx:v_idx])
-            y_val.append(y[t_idx:v_idx])
-            X_test1.append(X[v_idx:])
-            y_test1.append(y[v_idx:])
-
-    # Process UNSEEN subjects: Held out for strict cross-subject testing
-    for sid in unseen_subjects:
-        file_path = os.path.join(data_dir, f"S{sid}_preprocessed.npz")
-        if os.path.exists(file_path):
-            with np.load(file_path) as data:
-                X_test2.append(data['X'])
-                y_test2.append(data['y'])
-
-    # Final Concatenation and return
-    result = {}
-    splits = [('train', X_train, y_train), ('val', X_val, y_val), 
-              ('test1', X_test1, y_test1), ('test2', X_test2, y_test2)]
-
-    for name, X_list, y_list in splits:
-        if X_list:
-            result[name] = (np.concatenate(X_list, axis=0), np.concatenate(y_list, axis=0))
-            print(f"  {name}: {result[name][0].shape}")
-
-    return result
-
 def load_bi2014b_p300(data_dir: str, num_seen: int = 30, seed: int = 44) -> Dict:
 
     # Gather all processed files from bi2014b_processed folder
@@ -1016,8 +943,6 @@ def load_dataset(task: str, data_dir: Optional[str] = None,
         return load_lee2019_ssvep(data_dir, num_seen, seed)
     elif task == "BNCI2014_P300":
         return load_bnci_p300(data_dir, num_seen, seed)
-    elif task == "EPFL_P300":
-        return load_epfl_p300(data_dir, num_seen, seed)
     elif task == "BI2014b_P300":
         return load_bi2014b_p300(data_dir, num_seen, seed)
     else:

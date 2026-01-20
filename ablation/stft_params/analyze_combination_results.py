@@ -1,11 +1,11 @@
 """
-Analyze and Organize STFT Combination Ablation Results
+Analyze and Organize STFT 27-Config Ablation Results
 
-This script collects, analyzes, and organizes results from STFT parameter combination
+This script collects, analyzes, and organizes results from a fixed 3×3×3 (27-config)
 ablation studies into comprehensive CSV and JSON files.
 
 Usage:
-    python analyze_combination_results.py --results_dir ./ablation_results_combinations --output_dir ./analysis
+    python analyze_combination_results.py --results_dir ./ablation_results --output_dir ./analysis
 """
 
 import os
@@ -119,7 +119,7 @@ def evaluate_model_from_checkpoint(checkpoint_path: str, task: str) -> Optional[
     try:
         # Import here to avoid circular imports
         sys.path.insert(0, scale_net_path)
-        from scale_net_adaptive import ChannelWiseSpectralCLDNN_Dual, evaluate
+        from train_scale_net import ChannelWiseSpectralCLDNN, evaluate
         from dataset import load_dataset, create_dataloaders
         import torch.nn as nn
         
@@ -170,20 +170,22 @@ def evaluate_model_from_checkpoint(checkpoint_path: str, task: str) -> Optional[
         
         # Get model dimensions
         sample_x, _ = next(iter(loaders['val']))
-        sample_x_time, sample_x_spec = sample_x
-        _, n_channels, T_raw = sample_x_time.shape
-        _, _, freq_bins, time_bins = sample_x_spec.shape
+        # For regular scale_net, inputs is a list [x_time, x_spec], use spectral only
+        if isinstance(sample_x, list):
+            sample_x_spec = sample_x[1]
+        else:
+            sample_x_spec = sample_x
+        _, n_channels, freq_bins, time_bins = sample_x_spec.shape
         
         # Create model
         n_classes = config.get('n_classes', task_config.get('num_classes', 26))
         is_binary = (n_classes == 2)
         
-        model = ChannelWiseSpectralCLDNN_Dual(
+        model = ChannelWiseSpectralCLDNN(
             freq_bins=freq_bins,
             time_bins=time_bins,
             n_channels=n_channels,
             n_classes=n_classes,
-            T_raw=T_raw,
             cnn_filters=config.get('cnn_filters', 16),
             lstm_hidden=config.get('lstm_hidden', 128),
             pos_dim=config.get('pos_dim', 16),
@@ -264,20 +266,11 @@ def collect_results_from_directory(results_dir: str) -> Dict:
         try:
             df = pd.read_csv(csv_file)
             task = os.path.basename(csv_file).split('_')[0]
-            mode = 'unknown'
-            if 'smart' in csv_file:
-                mode = 'smart'
-            elif 'random' in csv_file:
-                mode = 'random'
-            elif 'grid' in csv_file:
-                mode = 'grid'
-            
-            key = f"{task}_{mode}"
+            key = f"{task}"
             csv_results[key] = {
                 'file': csv_file,
                 'data': df,
                 'task': task,
-                'mode': mode,
                 'num_configs': len(df)
             }
             print(f"  Loaded CSV: {csv_file} ({len(df)} configurations)")
@@ -412,7 +405,7 @@ def create_consolidated_results(collected_results: Dict, output_dir: str):
         )
         
         # Save consolidated CSV
-        consolidated_csv = os.path.join(output_dir, 'consolidated_stft_combinations_results.csv')
+        consolidated_csv = os.path.join(output_dir, 'consolidated_stft_27_results.csv')
         consolidated_df.to_csv(consolidated_csv, index=False)
         print(f"✓ Consolidated CSV saved: {consolidated_csv}")
         print(f"  Total configurations: {len(consolidated_df)}")
@@ -476,7 +469,7 @@ def create_consolidated_results(collected_results: Dict, output_dir: str):
         }
     
     # Save consolidated JSON
-    consolidated_json = os.path.join(output_dir, 'consolidated_stft_combinations_summary.json')
+    consolidated_json = os.path.join(output_dir, 'consolidated_stft_27_summary.json')
     with open(consolidated_json, 'w') as f:
         json.dump(all_json_data, f, indent=2)
     print(f"✓ Consolidated JSON saved: {consolidated_json}")
@@ -621,9 +614,9 @@ def main(results_dir: str, output_dir: str):
     print(f"{'='*80}")
     print(f"Results saved to: {output_dir}")
     print(f"\nGenerated files:")
-    print(f"  - consolidated_stft_combinations_results.csv")
+    print(f"  - consolidated_stft_27_results.csv")
     print(f"  - task_summary.csv")
-    print(f"  - consolidated_stft_combinations_summary.json")
+    print(f"  - consolidated_stft_27_summary.json")
     print(f"  - detailed_analysis.json")
     print(f"  - parameter_effects_analysis.csv")
     print(f"{'='*80}")
@@ -631,14 +624,14 @@ def main(results_dir: str, output_dir: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description='Analyze and Organize STFT Combination Ablation Results'
+        description='Analyze and Organize STFT 27-Config Ablation Results'
     )
     
     parser.add_argument(
         '--results_dir',
         type=str,
-        default='./ablation_results_combinations',
-        help='Directory containing ablation results (default: ./ablation_results_combinations)'
+        default='./ablation_results',
+        help='Directory containing ablation results (default: ./ablation_results)'
     )
     parser.add_argument(
         '--output_dir',
