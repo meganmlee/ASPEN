@@ -1,15 +1,13 @@
 """
 STFT 27-Config Ablation Study for Adaptive SCALE-Net
 
-This script performs systematic ablation study by testing a fixed 3×3×3 = 27 settings
+This script performs systematic ablation study by testing 27 settings
 of STFT parameters (nperseg, noverlap, nfft) to find optimal configurations.
 
 Each parameter has 3 values:
 - nperseg: [min, default, max]
 - overlap_ratio: [0.5, 0.75, 0.9375]
 - nfft: [small, default, large]
-
-Total: 3 × 3 × 3 = 27 settings
 
 Usage:
     python ablation_stft.py --task SSVEP
@@ -37,7 +35,7 @@ from dataset import TASK_CONFIGS
 
 def get_stft_param_settings(task: str) -> List[Dict]:
     """
-    Generate fixed 3×3×3 = 27 STFT parameter settings for a given task
+    Generate 27 STFT parameter settings for a given task
     
     Args:
         task: Task name
@@ -50,13 +48,14 @@ def get_stft_param_settings(task: str) -> List[Dict]:
     
     # Estimate typical input length based on task
     typical_input_lengths = {
-        'SSVEP': 250,
-        'Lee2019_SSVEP': 1000,
-        'P300': 256,
-        'BNCI2014_P300': 512,
-        'MI': 1000,
-        'Lee2019_MI': 1000,
-        'Imagined_speech': 1000,
+        'SSVEP': 250,  # 250 Hz: 250 samples = 1 sec
+        'Lee2019_SSVEP': 1000,  # 1000 Hz: 1000 samples = 1 sec
+        'P300': 256,  # 256 Hz: 256 samples = 1 sec
+        'BNCI2014_P300': 512,  # 256 Hz: but code resamples to 512 samples
+        'BI2014b_P300': 512,  # 512 Hz: 512 samples = 1 sec
+        'MI': 1000,  # 250 Hz: 1000 samples = 4 sec
+        'Lee2019_MI': 1000,  # 1000 Hz: 1000 samples = 1 sec
+        'Imagined_speech': 1000,  # 1000 Hz: 1000 samples = 1 sec
     }
     max_input_length = typical_input_lengths.get(task, 250)
     
@@ -150,7 +149,7 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
                              epochs: int = 30, batch_size: int = 16,
                              seed: int = 44, verbose: bool = True) -> Dict:
     """
-    Run STFT parameter ablation study for a task (fixed 3×3×3 = 27 settings)
+    Run STFT parameter ablation study for a task (27 settings)
     
     Args:
         task: Task name
@@ -165,7 +164,6 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
     """
     print(f"\n{'='*80}")
     print(f"STFT 27-Config Ablation Study: {task}")
-    print(f"3×3×3 = 27 settings")
     print(f"{'='*80}")
     
     task_config = TASK_CONFIGS.get(task, {})
@@ -440,7 +438,6 @@ def run_all_tasks_ablation(tasks: Optional[List[str]] = None,
     
     print(f"\n{'='*80}")
     print(f"STFT 27-Config Ablation Study - All Tasks")
-    print(f"3×3×3 = 27 settings per task")
     print(f"{'='*80}")
     print(f"Tasks: {tasks}")
     print(f"Configurations per task: 27")
@@ -527,7 +524,7 @@ def run_all_tasks_ablation(tasks: Optional[List[str]] = None,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description='STFT 27-Config Ablation Study for Adaptive SCALE-Net (3×3×3 = 27 settings)'
+        description='STFT 27-Config Ablation Study for Adaptive SCALE-Net (27 settings)'
     )
     
     parser.add_argument(
@@ -546,8 +543,8 @@ if __name__ == "__main__":
     parser.add_argument(
         '--epochs',
         type=int,
-        default=50,
-        help='Number of training epochs per configuration (default: 50)'
+        default=30,
+        help='Number of training epochs per configuration (default: 30)'
     )
     parser.add_argument(
         '--batch_size',
