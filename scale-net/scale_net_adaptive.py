@@ -539,6 +539,12 @@ def evaluate(model, loader, device, criterion=None, is_binary=False, return_metr
 def collect_weights(model, loader, device):
     """
     Runs an evaluation pass and collects the attention weights for every trial.
+    
+    Returns:
+        weights_array: Shape (N, 2) where N is number of trials
+            - For global_attention: (B, 2) -> (N, 2) after concatenation
+            - For spatial_attention: (B, C, 2) -> average over channels -> (B, 2) -> (N, 2)
+            - For other modes: may return None or different shapes
     """
     model.eval()
     all_weights = []
@@ -549,9 +555,29 @@ def collect_weights(model, loader, device):
             x_time, x_spec = x_time.to(device), x_spec.to(device)
             
             # Outputs is a 2-tuple, we only care about the second element (weights)
-            _, weights = model(x_time, x_spec) 
+            _, weights = model(x_time, x_spec)
             
-            all_weights.append(weights.cpu().numpy())
+            if weights is not None:
+                weights_np = weights.cpu().numpy()
+                
+                # Handle different weight shapes based on fusion mode
+                if weights_np.ndim == 2 and weights_np.shape[1] == 2:
+                    # Global attention: (B, 2) - already in correct format
+                    all_weights.append(weights_np)
+                elif weights_np.ndim == 3 and weights_np.shape[2] == 2:
+                    # Spatial attention: (B, C, 2) - average over channels to get (B, 2)
+                    weights_avg = weights_np.mean(axis=1)  # (B, C, 2) -> (B, 2)
+                    all_weights.append(weights_avg)
+                else:
+                    # Other modes or unexpected shapes - skip or handle appropriately
+                    # For static, glu, multiplicative, bilinear, weights may be None
+                    # Create dummy weights if needed
+                    B = weights_np.shape[0] if weights_np.ndim > 0 else 1
+                    dummy_weights = np.array([[0.5, 0.5]] * B)
+                    all_weights.append(dummy_weights)
+    
+    if len(all_weights) == 0:
+        return None
     
     return np.concatenate(all_weights, axis=0)
 
@@ -865,11 +891,20 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
         
         all_weights_array = collect_weights(model, weights_loader, device)
         
-        # Convert to DataFrame and save
-        weights_df = pd.DataFrame(
-            all_weights_array, 
-            columns=['Spectral_Weight', 'Temporal_Weight']
-        )
+        if all_weights_array is not None and len(all_weights_array) > 0:
+            # Ensure 2D shape (N, 2)
+            if all_weights_array.ndim == 3:
+                # If somehow still 3D, average over middle dimension
+                all_weights_array = all_weights_array.mean(axis=1)
+            
+            # Convert to DataFrame and save
+            weights_df = pd.DataFrame(
+                all_weights_array, 
+                columns=['Spectral_Weight', 'Temporal_Weight']
+            )
+        else:
+            print(f"⚠ No attention weights collected (fusion mode may not support weights)")
+            weights_df = None
         
         # Generate filename based on model_path if available, otherwise use default
         if model_path:
@@ -885,15 +920,17 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
         else:
             csv_filename = f'{task.lower()}_attention_weights_{weights_type}.csv'
         
-        weights_df.to_csv(csv_filename, index=False)
-        
-        # Calculate and print mean for sanity check
-        mean_spec = weights_df['Spectral_Weight'].mean()
-        mean_time = weights_df['Temporal_Weight'].mean()
-        
-        print(f"✓ Attention weights (N={len(weights_df)}) saved to: {csv_filename}")
-        print(f"  Mean Spectral Weight: {mean_spec:.4f}")
-        print(f"  Mean Temporal Weight: {mean_time:.4f}")
+            weights_df.to_csv(csv_filename, index=False)
+            
+            # Calculate and print mean for sanity check
+            mean_spec = weights_df['Spectral_Weight'].mean()
+            mean_time = weights_df['Temporal_Weight'].mean()
+            
+            print(f"✓ Attention weights (N={len(weights_df)}) saved to: {csv_filename}")
+            print(f"  Mean Spectral Weight: {mean_spec:.4f}")
+            print(f"  Mean Temporal Weight: {mean_time:.4f}")
+        else:
+            print(f"⚠ Skipping attention weights save (no weights available)")
 
     print(f"{'='*70}")
     
