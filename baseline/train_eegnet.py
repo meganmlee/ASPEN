@@ -566,9 +566,22 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
     
     # ====== Loss & Optimizer ======
     is_binary = (n_classes == 2)
+    train_labels = datasets['train'][1]
     if is_binary:
-        criterion = nn.BCEWithLogitsLoss()
-        print("Using BCEWithLogitsLoss for binary classification")
+        # Calculate class imbalance
+        class_counts = np.bincount(train_labels)
+        class_ratio = class_counts[0] / class_counts[1] if len(class_counts) > 1 else 1.0
+        
+        print(f"  Imbalance Ratio: {class_ratio:.2f}:1")
+        
+        # Only use pos_weight if imbalance ratio > 1.5
+        if class_ratio > 1.5 or class_ratio < 0.67:
+            pos_weight = torch.tensor([class_ratio], device=device)
+            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+            print(f"Using BCEWithLogitsLoss with pos_weight={class_ratio:.2f} (imbalanced)")
+        else:
+            criterion = nn.BCEWithLogitsLoss()
+            print(f"Using BCEWithLogitsLoss without pos_weight (balanced dataset)")
     else:
         criterion = nn.CrossEntropyLoss()
         print(f"Using CrossEntropyLoss for {n_classes}-class classification")
@@ -745,7 +758,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description='Train EEGNet baseline on EEG tasks')
     parser.add_argument('--task', type=str, default='SSVEP',
-                        choices=['SSVEP', 'P300', 'MI', 'Imagined_speech', 'Lee2019_MI', 'Lee2019_SSVEP', 'BNCI2014_P300', 'all'],
+                        choices=['SSVEP', 'P300', 'MI', 'Imagined_speech', 'Lee2019_MI', 'Lee2019_SSVEP', 'BNCI2014_P300', 'EPFL_P300', 'BI2014b_P300', 'all'],
                         help='Task to train on (default: SSVEP)')
     parser.add_argument('--save_dir', type=str, default='./checkpoints',
                         help='Directory to save model checkpoints')
@@ -765,7 +778,7 @@ if __name__ == "__main__":
         'batch_size': args.batch_size,
         'lr': args.lr,
         'weight_decay': 1e-4,
-        'patience': 20,
+        'patience': 15,
         'scheduler': 'ReduceLROnPlateau',
         'seed': args.seed,
     }
