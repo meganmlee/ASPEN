@@ -9,7 +9,7 @@ import os
 import random
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset
 from scipy import signal
 from collections import defaultdict
 from typing import Dict, Tuple, Optional, List
@@ -42,7 +42,7 @@ TASK_CONFIGS = {
         "num_subjects": 54,
         "num_seen": 40,
         "data_dir": "/ocean/projects/cis250213p/shared/lee2019_ssvep_processed",
-        "sampling_rate": 1000,
+        "sampling_rate": 250,
         "stft_nperseg": 128,
         "stft_noverlap": 112,
         "stft_nfft": 512,
@@ -62,7 +62,7 @@ TASK_CONFIGS = {
         "num_subjects": 10,
         "num_seen": 7,
         "data_dir": "/ocean/projects/cis250213p/shared/bnci2014_p300",
-        "sampling_rate": 256,
+        "sampling_rate": 512,
         "stft_nperseg": 256,
         "stft_noverlap": 240,
         "stft_nfft": 512,
@@ -72,7 +72,7 @@ TASK_CONFIGS = {
         "num_subjects": 38,
         "num_seen": 30,
         "data_dir": "/ocean/projects/cis250213p/shared/bi2014b_processed",
-        "sampling_rate": 512,
+        "sampling_rate": 256,
         "stft_nperseg": 64,
         "stft_noverlap": 56,
         "stft_nfft": 256,
@@ -92,7 +92,7 @@ TASK_CONFIGS = {
         "num_subjects": 54,
         "num_seen": 40,
         "data_dir": "/ocean/projects/cis250213p/shared/lee2019_mi_processed",
-        "sampling_rate": 1000,
+        "sampling_rate": 250,
         "stft_nperseg": 128,
         "stft_noverlap": 112,
         "stft_nfft": 512,
@@ -229,36 +229,98 @@ def load_lee2019_ssvep(data_dir: str, num_seen: int = 40, seed: int = 44) -> Dic
     - Seen Subjects (40): Trials are shuffled and split into Train, Val, and Test1.
     - Unseen Subjects (14): All trials are put into Test2.
     
-    This evaluates "Cross-Subject Generalization," which is much harder as the 
-    model must handle inter-subject variability.
+    1. Shuffles trials within subjects to avoid temporal drift
+    2. Uses stratified subject selection for balanced difficulty
+    3. Ensures fair comparison between seen/unseen splits
     """
-    all_subjects = list(range(1, 55))  # 54 subjects total
     random.seed(seed)
     np.random.seed(seed)
     
-    # Subject-level split: This is the core of "Unseen Subjects"
-    seen_subjects = random.sample(all_subjects, num_seen)
-    unseen_subjects = [s for s in all_subjects if s not in seen_subjects]
-
     print(f"[Lee2019_SSVEP] Loading from: {data_dir}")
-    print(f"[Lee2019_SSVEP] Seen subjects (Internal Split): {len(seen_subjects)}")
-    print(f"[Lee2019_SSVEP] Unseen subjects (Entirely New): {len(unseen_subjects)}")
-
-    X_train, y_train = [], []
-    X_val, y_val = [], []
-    X_test1, y_test1 = [], [] 
-    X_test2, y_test2 = [], []
-
-    # Process SEEN subjects: Split their trials into Train/Val/Test1
-    for sid in seen_subjects:
+    
+    # Load all subjects and calculate difficulty metrics
+    all_subjects = list(range(1, 55))
+    subject_metrics = {}
+    
+    for sid in all_subjects:
         file_path = os.path.join(data_dir, f"S{sid}_preprocessed.npz")
-        if not os.path.exists(file_path): continue
+        if not os.path.exists(file_path):
+            continue
             
         with np.load(file_path) as data:
             X, y = data['X'], data['y']
             
-            t_idx = int(len(X) * 0.6)
-            v_idx = int(len(X) * 0.8)
+            # Quick separability estimate (faster than full LDA)
+            # Use class-wise variance ratio
+            class_means = []
+            for c in np.unique(y):
+                class_means.append(np.mean(X[y == c], axis=0).flatten())
+            
+            # Between-class variance vs within-class variance
+            between_var = np.var(class_means, axis=0).mean()
+            within_var = np.mean([np.var(X[y == c]) for c in np.unique(y)])
+            separability = between_var / (within_var + 1e-8)
+            
+            subject_metrics[sid] = {
+                'separability': separability,
+                'n_trials': len(X)
+            }
+    
+    available_subjects = list(subject_metrics.keys())
+    
+    # Stratified subject split by difficulty
+    sorted_subjects = sorted(available_subjects, 
+                            key=lambda s: subject_metrics[s]['separability'])
+    
+    # Interleaved assignment for balance
+    seen_subjects = []
+    unseen_subjects = []
+    
+    for i, sid in enumerate(sorted_subjects):
+        if i % (len(sorted_subjects) // (len(sorted_subjects) - num_seen)) == 0 and \
+           len(unseen_subjects) < (len(sorted_subjects) - num_seen):
+            unseen_subjects.append(sid)
+        else:
+            if len(seen_subjects) < num_seen:
+                seen_subjects.append(sid)
+            else:
+                unseen_subjects.append(sid)
+    
+    # Shuffle within groups to randomize
+    random.shuffle(seen_subjects)
+    random.shuffle(unseen_subjects)
+    
+    # Verify balance
+    seen_sep = np.mean([subject_metrics[s]['separability'] for s in seen_subjects])
+    unseen_sep = np.mean([subject_metrics[s]['separability'] for s in unseen_subjects])
+    
+    print(f"[Lee2019_SSVEP] Stratified Split:")
+    print(f"  Seen ({len(seen_subjects)} subjects): Avg separability = {seen_sep:.6f}")
+    print(f"  Unseen ({len(unseen_subjects)} subjects): Avg separability = {unseen_sep:.6f}")
+    print(f"  Difference: {abs(seen_sep - unseen_sep):.6f}")
+
+    X_train, y_train = [], []
+    X_val, y_val = [], []
+    X_test1, y_test1 = [], []
+    X_test2, y_test2 = [], []
+
+    # Process SEEN subjects
+    for sid in seen_subjects:
+        file_path = os.path.join(data_dir, f"S{sid}_preprocessed.npz")
+        if not os.path.exists(file_path): 
+            continue
+            
+        with np.load(file_path) as data:
+            X, y = data['X'], data['y']
+            
+            # Shuffle trials to eliminate temporal bias
+            n = len(X)
+            indices = np.random.permutation(n)
+            X = X[indices]
+            y = y[indices]
+            
+            t_idx = int(n * 0.6)
+            v_idx = int(n * 0.8)
             
             X_train.append(X[:t_idx])
             y_train.append(y[:t_idx])
@@ -269,15 +331,18 @@ def load_lee2019_ssvep(data_dir: str, num_seen: int = 40, seed: int = 44) -> Dic
             X_test1.append(X[v_idx:])
             y_test1.append(y[v_idx:])
 
-    # Process UNSEEN subjects: No trials from these people go into Training
+    # Process UNSEEN subjects
     for sid in unseen_subjects:
         file_path = os.path.join(data_dir, f"S{sid}_preprocessed.npz")
         if os.path.exists(file_path):
             with np.load(file_path) as data:
-                X_test2.append(data['X'])
-                y_test2.append(data['y'])
+                X, y = data['X'], data['y']
+                
+                # Shuffle unseen too for consistency
+                indices = np.random.permutation(len(X))
+                X_test2.append(X[indices])
+                y_test2.append(y[indices])
 
-    # Final Concatenation
     result = {}
     splits = [('train', X_train, y_train), ('val', X_val, y_val), 
               ('test1', X_test1, y_test1), ('test2', X_test2, y_test2)]
