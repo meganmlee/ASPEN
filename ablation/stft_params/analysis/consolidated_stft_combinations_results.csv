@@ -1,0 +1,13 @@
+task,config_name,nperseg,noverlap,nfft,overlap_ratio,val_acc,test1_acc,test2_acc,model_path,epoch,source_file,mode
+SSVEP,nperseg64_overlap50pct_nfft1024,64,32,1024,0.5,86.36363636363636,,,./ablation_results_combinations/ssvep_stft_nperseg64_overlap50pct_nfft1024_model.pth,45,checkpoint_extraction,checkpoint
+SSVEP,nperseg64_overlap50pct_nfft2048,64,32,2048,0.5,84.26573426573427,,,./ablation_results_combinations/ssvep_stft_nperseg64_overlap50pct_nfft2048_model.pth,43,checkpoint_extraction,checkpoint
+SSVEP,nperseg128_overlap87pct_nfft512,128,111,512,0.87,84.03263403263404,,,./ablation_results_combinations/ssvep_stft_nperseg128_overlap87pct_nfft512_model.pth,49,checkpoint_extraction,checkpoint
+SSVEP,nperseg64_overlap87pct_nfft512,64,55,512,0.87,83.1002331002331,,,./ablation_results_combinations/ssvep_stft_nperseg64_overlap87pct_nfft512_model.pth,49,checkpoint_extraction,checkpoint
+SSVEP,nperseg64_overlap87pct_nfft1024,64,55,1024,0.87,81.81818181818181,,,./ablation_results_combinations/ssvep_stft_nperseg64_overlap87pct_nfft1024_model.pth,42,checkpoint_extraction,checkpoint
+SSVEP,nperseg64_overlap75pct_nfft512,64,48,512,0.75,79.48717948717949,,,./ablation_results_combinations/ssvep_stft_nperseg64_overlap75pct_nfft512_model.pth,46,checkpoint_extraction,checkpoint
+SSVEP,nperseg64_overlap93pct_nfft512,64,59,512,0.93,78.9044289044289,,,./ablation_results_combinations/ssvep_stft_nperseg64_overlap93pct_nfft512_model.pth,49,checkpoint_extraction,checkpoint
+SSVEP,nperseg64_overlap75pct_nfft1024,64,48,1024,0.75,78.32167832167832,,,./ablation_results_combinations/ssvep_stft_nperseg64_overlap75pct_nfft1024_model.pth,46,checkpoint_extraction,checkpoint
+SSVEP,nperseg64_overlap87pct_nfft2048,64,55,2048,0.87,74.24242424242425,,,./ablation_results_combinations/ssvep_stft_nperseg64_overlap87pct_nfft2048_model.pth,25,checkpoint_extraction,checkpoint
+SSVEP,nperseg64_overlap50pct_nfft512,64,32,512,0.5,73.65967365967366,,,./ablation_results_combinations/ssvep_stft_nperseg64_overlap50pct_nfft512_model.pth,24,checkpoint_extraction,checkpoint
+SSVEP,nperseg64_overlap75pct_nfft2048,64,48,2048,0.75,72.96037296037296,,,./ablation_results_combinations/ssvep_stft_nperseg64_overlap75pct_nfft2048_model.pth,30,checkpoint_extraction,checkpoint
+SSVEP,nperseg64_overlap93pct_nfft1024,64,59,1024,0.93,68.41491841491842,,,./ablation_results_combinations/ssvep_stft_nperseg64_overlap93pct_nfft1024_model.pth,8,checkpoint_extraction,checkpoint

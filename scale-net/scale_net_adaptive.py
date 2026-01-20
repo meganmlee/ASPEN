@@ -14,6 +14,7 @@ import os
 import pandas as pd
 from typing import Optional, Dict, Tuple
 from seed_utils import seed_everything
+from sklearn.metrics import f1_score, recall_score, roc_auc_score
 
 # Import from dataset.py
 from dataset import (
@@ -326,9 +327,28 @@ def train_epoch(model, loader, criterion, optimizer, device, is_binary=False):
     return total_loss / len(loader), 100. * correct / total
 
 
-def evaluate(model, loader, device, criterion=None, is_binary=False):
+def evaluate(model, loader, device, criterion=None, is_binary=False, return_metrics=False):
+    """
+    Evaluate model on a dataset
+    
+    Args:
+        model: Model to evaluate
+        loader: DataLoader
+        device: Device to run on
+        criterion: Loss function (optional)
+        is_binary: Whether this is binary classification
+        return_metrics: If True, return additional metrics (f1, recall, auc)
+    
+    Returns:
+        If return_metrics=False: (avg_loss, acc)
+        If return_metrics=True: (avg_loss, acc, metrics_dict)
+            where metrics_dict contains 'f1', 'recall', 'auc' (if applicable)
+    """
     model.eval()
     total_loss, correct, total = 0.0, 0, 0
+    all_preds = []
+    all_labels = []
+    all_probs = []  # For AUC calculation
     
     with torch.no_grad():
         for inputs, labels in tqdm(loader, desc='Eval', ncols=100):
@@ -348,16 +368,84 @@ def evaluate(model, loader, device, criterion=None, is_binary=False):
             
             # Prediction: binary uses sigmoid threshold, multi-class uses argmax
             if is_binary:
-                pred = (torch.sigmoid(outputs) > 0.5).squeeze(1).long()  # (B, 1) → (B,)
+                probs = torch.sigmoid(outputs).squeeze(1)  # (B,)
+                pred = (probs > 0.5).long()  # (B,)
+                if return_metrics:
+                    all_probs.append(probs.cpu().numpy())
             else:
+                probs = F.softmax(outputs, dim=1)  # (B, n_classes)
                 _, pred = outputs.max(1)
+                if return_metrics:
+                    all_probs.append(probs.cpu().numpy())
+            
+            if return_metrics:
+                all_preds.append(pred.cpu().numpy())
+                all_labels.append(labels.cpu().numpy())
             
             total += labels.size(0)
             correct += pred.eq(labels).sum().item()
     
     avg_loss = total_loss / len(loader) if criterion is not None else None
     acc = 100. * correct / total
-    return avg_loss, acc
+    
+    if not return_metrics:
+        return avg_loss, acc
+    
+    # Calculate additional metrics
+    all_preds = np.concatenate(all_preds)
+    all_labels = np.concatenate(all_labels)
+    all_probs = np.concatenate(all_probs)
+    
+    metrics = {}
+    
+    # F1 score (macro average for multi-class, binary for binary)
+    if is_binary:
+        f1 = f1_score(all_labels, all_preds, average='binary', zero_division=0)
+    else:
+        f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+    metrics['f1'] = f1 * 100  # Convert to percentage
+    
+    # Recall (macro average for multi-class, binary for binary)
+    if is_binary:
+        recall = recall_score(all_labels, all_preds, average='binary', zero_division=0)
+    else:
+        recall = recall_score(all_labels, all_preds, average='macro', zero_division=0)
+    metrics['recall'] = recall * 100  # Convert to percentage
+    
+    # AUC
+    try:
+        if is_binary:
+            # Binary classification: use probabilities directly
+            auc = roc_auc_score(all_labels, all_probs)
+            metrics['auc'] = auc * 100  # Convert to percentage
+        else:
+            # Multi-class: use sklearn's built-in multi-class AUC
+            n_classes = all_probs.shape[1]
+            if n_classes == 2:
+                # Binary case with 2 classes (use positive class probability)
+                auc = roc_auc_score(all_labels, all_probs[:, 1])
+                metrics['auc'] = auc * 100
+            else:
+                # Multi-class: use one-vs-rest (ovr) or one-vs-one (ovo) approach
+                # 'ovr' computes AUC for each class against the rest, then averages
+                # 'macro' averages the AUCs of each class
+                try:
+                    # Try one-vs-rest macro average
+                    auc = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='macro')
+                    metrics['auc'] = auc * 100
+                except ValueError:
+                    # Fallback: if some classes are missing, try weighted average
+                    try:
+                        auc = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='weighted')
+                        metrics['auc'] = auc * 100
+                    except ValueError:
+                        # If still fails, set to None
+                        metrics['auc'] = None
+    except (ValueError, IndexError) as e:
+        # If AUC calculation fails (e.g., only one class present), set to None
+        metrics['auc'] = None
+    
+    return avg_loss, acc, metrics
 
 
 # ==================== Main Training ====================
@@ -605,26 +693,54 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
     # Handle DataParallel wrapper when loading
     unwrap_model(model).load_state_dict(checkpoint['model_state_dict'])
     
-    results = {'val': best_val_acc}
+    # Evaluate validation set with metrics
+    val_loss, val_acc, val_metrics = evaluate(model, val_loader, device, criterion, is_binary=is_binary, return_metrics=True)
+    results = {
+        'val': best_val_acc,
+        'val_f1': val_metrics.get('f1'),
+        'val_recall': val_metrics.get('recall'),
+        'val_auc': val_metrics.get('auc'),
+    }
     
     if test1_loader:
-        test1_loss, test1_acc = evaluate(model, test1_loader, device, criterion, is_binary=is_binary)
+        test1_loss, test1_acc, test1_metrics = evaluate(model, test1_loader, device, criterion, is_binary=is_binary, return_metrics=True)
         results['test1'] = test1_acc
         results['test1_loss'] = test1_loss
+        results['test1_f1'] = test1_metrics.get('f1')
+        results['test1_recall'] = test1_metrics.get('recall')
+        results['test1_auc'] = test1_metrics.get('auc')
     
     if test2_loader:
-        test2_loss, test2_acc = evaluate(model, test2_loader, device, criterion, is_binary=is_binary)
+        test2_loss, test2_acc, test2_metrics = evaluate(model, test2_loader, device, criterion, is_binary=is_binary, return_metrics=True)
         results['test2'] = test2_acc
         results['test2_loss'] = test2_loss
+        results['test2_f1'] = test2_metrics.get('f1')
+        results['test2_recall'] = test2_metrics.get('recall')
+        results['test2_auc'] = test2_metrics.get('auc')
     
     print(f"\n{'='*70}")
     print(f"FINAL RESULTS - {task}")
     print(f"{'='*70}")
     print(f"Best Val Acc:    {best_val_acc:.2f}%")
+    if results.get('val_f1') is not None:
+        print(f"Val F1:          {results['val_f1']:.2f}%")
+        print(f"Val Recall:      {results['val_recall']:.2f}%")
+        if results.get('val_auc') is not None:
+            print(f"Val AUC:         {results['val_auc']:.2f}%")
     if 'test1' in results:
         print(f"Test1 (Seen):    {results['test1']:.2f}% (loss {results['test1_loss']:.4f})")
+        if results.get('test1_f1') is not None:
+            print(f"  Test1 F1:      {results['test1_f1']:.2f}%")
+            print(f"  Test1 Recall:  {results['test1_recall']:.2f}%")
+            if results.get('test1_auc') is not None:
+                print(f"  Test1 AUC:     {results['test1_auc']:.2f}%")
     if 'test2' in results:
         print(f"Test2 (Unseen):  {results['test2']:.2f}% (loss {results['test2_loss']:.4f})")
+        if results.get('test2_f1') is not None:
+            print(f"  Test2 F1:      {results['test2_f1']:.2f}%")
+            print(f"  Test2 Recall:  {results['test2_recall']:.2f}%")
+            if results.get('test2_auc') is not None:
+                print(f"  Test2 AUC:     {results['test2_auc']:.2f}%")
     print(f"{'='*70}")
 
     # ====== COLLECT AND SAVE ATTENTION WEIGHTS ======
@@ -648,7 +764,20 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
             columns=['Spectral_Weight', 'Temporal_Weight']
         )
         
-        csv_filename = f'{task.lower()}_attention_weights_{weights_type}.csv'
+        # Generate filename based on model_path if available, otherwise use default
+        if model_path:
+            # Extract config name from model path if it follows the pattern
+            # e.g., "ssvep_stft_nperseg128_overlap50pct_nfft512_model.pth" -> "nperseg128_overlap50pct_nfft512"
+            import os
+            base_name = os.path.basename(model_path)
+            if '_stft_' in base_name and '_model.pth' in base_name:
+                config_part = base_name.split('_stft_')[1].replace('_model.pth', '')
+                csv_filename = f'{task.lower()}_attention_weights_{config_part}_{weights_type}.csv'
+            else:
+                csv_filename = f'{task.lower()}_attention_weights_{weights_type}.csv'
+        else:
+            csv_filename = f'{task.lower()}_attention_weights_{weights_type}.csv'
+        
         weights_df.to_csv(csv_filename, index=False)
         
         # Calculate and print mean for sanity check
