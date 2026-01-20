@@ -21,14 +21,108 @@ import argparse
 from typing import Dict, List, Tuple, Optional
 import pandas as pd
 from datetime import datetime
+import torch
+import torch.nn.functional as F
+import numpy as np
+from sklearn.metrics import f1_score, recall_score, roc_auc_score
+from tqdm import tqdm
 
 # Add scale-net directory to path
 scale_net_path = os.path.join(os.path.dirname(__file__), '..', '..', 'scale-net')
 sys.path.insert(0, scale_net_path)
 
 # Import from scale-net
-from train_scale_net import train_task
-from dataset import TASK_CONFIGS
+from train_scale_net import train_task, ChannelWiseSpectralCLDNN
+from dataset import TASK_CONFIGS, load_dataset, create_dataloaders
+
+
+# ==================== Evaluation with Metrics ====================
+
+def evaluate_with_metrics(model, loader, device, is_binary=False):
+    """
+    Evaluate model and calculate f1, recall, auc metrics
+    
+    Args:
+        model: Trained model
+        loader: DataLoader for evaluation
+        device: Device to run on
+        is_binary: Whether this is binary classification
+        
+    Returns:
+        Dictionary with 'acc', 'f1', 'recall', 'auc' (if applicable)
+    """
+    model.eval()
+    all_preds = []
+    all_labels = []
+    all_probs = []
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for inputs, labels in tqdm(loader, desc='Eval Metrics', ncols=100, leave=False):
+            if isinstance(inputs, (list, tuple)):
+                # Handle (x_time, x_spec) tuple
+                x_time, x_spec = inputs
+                x_time, x_spec = x_time.to(device), x_spec.to(device)
+                outputs = model(x_spec)  # ChannelWiseSpectralCLDNN only takes spectral input
+            else:
+                inputs = inputs.to(device)
+                outputs = model(inputs)
+            
+            labels = labels.to(device)
+            
+            # Get predictions and probabilities
+            if is_binary:
+                probs = torch.sigmoid(outputs).squeeze(1) if outputs.dim() > 1 else torch.sigmoid(outputs)
+                pred = (probs > 0.5).long()
+            else:
+                probs = F.softmax(outputs, dim=1)
+                _, pred = outputs.max(1)
+            
+            all_preds.append(pred.cpu().numpy())
+            all_labels.append(labels.cpu().numpy())
+            all_probs.append(probs.cpu().numpy())
+            
+            total += labels.size(0)
+            correct += pred.eq(labels).sum().item()
+    
+    # Concatenate all predictions
+    all_preds = np.concatenate(all_preds)
+    all_labels = np.concatenate(all_labels)
+    all_probs = np.concatenate(all_probs)
+    
+    # Calculate accuracy
+    acc = 100.0 * correct / total
+    
+    metrics = {'acc': acc}
+    
+    # Calculate F1 score
+    if is_binary:
+        f1 = f1_score(all_labels, all_preds, average='binary', zero_division=0)
+    else:
+        f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+    metrics['f1'] = f1 * 100
+    
+    # Calculate Recall
+    if is_binary:
+        recall = recall_score(all_labels, all_preds, average='binary', zero_division=0)
+    else:
+        recall = recall_score(all_labels, all_preds, average='macro', zero_division=0)
+    metrics['recall'] = recall * 100
+    
+    # Calculate AUC
+    try:
+        if is_binary:
+            auc = roc_auc_score(all_labels, all_probs)
+        else:
+            # Multi-class: use one-vs-rest
+            auc = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='macro')
+        metrics['auc'] = auc * 100
+    except Exception as e:
+        # If AUC calculation fails (e.g., only one class present), set to None
+        metrics['auc'] = None
+    
+    return metrics
 
 
 # ==================== STFT 27-Config Generation ====================
@@ -319,6 +413,73 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
                 model_path=model_path
             )
             
+            # Load data and create loaders for metric calculation
+            datasets = load_dataset(
+                task=task,
+                data_dir=task_config.get('data_dir'),
+                num_seen=task_config.get('num_seen'),
+                seed=seed
+            )
+            
+            stft_config = {
+                'fs': sampling_rate,
+                'nperseg': nperseg,
+                'noverlap': noverlap,
+                'nfft': nfft
+            }
+            
+            loaders = create_dataloaders(
+                datasets,
+                stft_config,
+                batch_size=batch_size,
+                num_workers=0,  # Use 0 to avoid multiprocessing issues
+                augment_train=False,
+                seed=seed
+            )
+            
+            # Get model dimensions
+            sample_x, _ = next(iter(loaders['train']))
+            if isinstance(sample_x, (list, tuple)):
+                _, n_channels, freq_bins, time_bins = sample_x[1].shape
+            else:
+                _, n_channels, freq_bins, time_bins = sample_x.shape
+            
+            # Reload best model
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            checkpoint = torch.load(model_path, map_location=device)
+            
+            n_classes = task_config.get('num_classes', 26)
+            is_binary = (n_classes == 2)
+            
+            # Create model and load weights
+            eval_model = ChannelWiseSpectralCLDNN(
+                freq_bins=freq_bins,
+                time_bins=time_bins,
+                n_channels=n_channels,
+                n_classes=n_classes,
+                cnn_filters=config['cnn_filters'],
+                lstm_hidden=config['lstm_hidden'],
+                pos_dim=config['pos_dim'],
+                dropout=config.get('dropout', 0.3),
+                cnn_dropout=config.get('cnn_dropout', 0.2),
+                use_hidden_layer=config.get('use_hidden_layer', False),
+                hidden_dim=config.get('hidden_dim', 64)
+            ).to(device)
+            
+            eval_model.load_state_dict(checkpoint['model_state_dict'])
+            eval_model.eval()
+            
+            # Calculate metrics for each split
+            val_metrics = evaluate_with_metrics(eval_model, loaders['val'], device, is_binary=is_binary)
+            test1_metrics = None
+            test2_metrics = None
+            
+            if 'test1' in loaders:
+                test1_metrics = evaluate_with_metrics(eval_model, loaders['test1'], device, is_binary=is_binary)
+            
+            if 'test2' in loaders:
+                test2_metrics = evaluate_with_metrics(eval_model, loaders['test2'], device, is_binary=is_binary)
+            
             # Extract results
             result = {
                 'task': task,
@@ -330,19 +491,19 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
                 'time_resolution_sec': nperseg / sampling_rate,
                 'time_step_sec': (nperseg - noverlap) / sampling_rate,
                 'freq_resolution_hz': sampling_rate / nfft,
-                'val_acc': train_results.get('val', 0.0),
-                'val_f1': train_results.get('val_f1', None),
-                'val_recall': train_results.get('val_recall', None),
-                'val_auc': train_results.get('val_auc', None),
-                'test1_acc': train_results.get('test1', 0.0),
-                'test1_f1': train_results.get('test1_f1', None),
-                'test1_recall': train_results.get('test1_recall', None),
-                'test1_auc': train_results.get('test1_auc', None),
+                'val_acc': val_metrics['acc'],
+                'val_f1': val_metrics.get('f1'),
+                'val_recall': val_metrics.get('recall'),
+                'val_auc': val_metrics.get('auc'),
+                'test1_acc': test1_metrics['acc'] if test1_metrics else None,
+                'test1_f1': test1_metrics.get('f1') if test1_metrics else None,
+                'test1_recall': test1_metrics.get('recall') if test1_metrics else None,
+                'test1_auc': test1_metrics.get('auc') if test1_metrics else None,
                 'test1_loss': train_results.get('test1_loss', None),
-                'test2_acc': train_results.get('test2', 0.0),
-                'test2_f1': train_results.get('test2_f1', None),
-                'test2_recall': train_results.get('test2_recall', None),
-                'test2_auc': train_results.get('test2_auc', None),
+                'test2_acc': test2_metrics['acc'] if test2_metrics else None,
+                'test2_f1': test2_metrics.get('f1') if test2_metrics else None,
+                'test2_recall': test2_metrics.get('recall') if test2_metrics else None,
+                'test2_auc': test2_metrics.get('auc') if test2_metrics else None,
                 'test2_loss': train_results.get('test2_loss', None),
             }
             
