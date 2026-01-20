@@ -66,54 +66,113 @@ def get_stft_param_settings(task: str) -> List[Dict]:
     
     # Define parameter ranges
     if sampling_rate <= 256:
-        nperseg_options = [n for n in [64, 128, 256] if n <= max_input_length]
+        nperseg_candidates = [64, 128, 256]
         if 512 <= max_input_length:
-            nperseg_options.append(512)
+            nperseg_candidates.append(512)
     elif sampling_rate <= 512:
-        nperseg_options = [n for n in [128, 256, 512] if n <= max_input_length]
+        nperseg_candidates = [64, 128, 256, 512]
         if 1024 <= max_input_length:
-            nperseg_options.append(1024)
+            nperseg_candidates.append(1024)
     else:  # 1000 Hz
-        nperseg_options = [n for n in [256, 512, 1024] if n <= max_input_length]
+        nperseg_candidates = [256, 512, 1024]
         if 2048 <= max_input_length:
-            nperseg_options.append(2048)
+            nperseg_candidates.append(2048)
     
-    # Select 3 nperseg values: min, default, max
+    # Filter by max_input_length and ensure default is included
+    nperseg_options = [n for n in nperseg_candidates if n <= max_input_length]
+    
+    # Ensure default_nperseg is included if it's valid
+    if default_nperseg <= max_input_length and default_nperseg not in nperseg_options:
+        nperseg_options.append(default_nperseg)
+        nperseg_options = sorted(nperseg_options)
+    
+    # Select 3 nperseg values: min, default (or closest), max
     nperseg_values = []
     if len(nperseg_options) == 1:
         nperseg_values = nperseg_options
     elif len(nperseg_options) == 2:
         nperseg_values = nperseg_options
     else:
-        nperseg_values = [
-            min(nperseg_options),
-            default_nperseg if default_nperseg in nperseg_options else nperseg_options[len(nperseg_options)//2],
-            max([n for n in nperseg_options if n <= max_input_length])
-        ]
-        # Remove duplicates and sort
+        # Always include default if possible, otherwise use middle value
+        min_val = min(nperseg_options)
+        max_val = max([n for n in nperseg_options if n <= max_input_length])
+        
+        if default_nperseg in nperseg_options:
+            mid_val = default_nperseg
+        else:
+            # Find closest to default
+            mid_val = min(nperseg_options, key=lambda x: abs(x - default_nperseg))
+        
+        nperseg_values = [min_val, mid_val, max_val]
+        # Remove duplicates and ensure exactly 3
         nperseg_values = sorted(list(set(nperseg_values)))
-        # Ensure we have exactly 3
         if len(nperseg_values) > 3:
             nperseg_values = [nperseg_values[0], nperseg_values[len(nperseg_values)//2], nperseg_values[-1]]
+        elif len(nperseg_values) < 3:
+            # Fill missing values
+            if len(nperseg_values) == 2:
+                # Add middle value
+                mid = (nperseg_values[0] + nperseg_values[1]) // 2
+                # Find closest in options
+                closest = min(nperseg_options, key=lambda x: abs(x - mid))
+                nperseg_values.insert(1, closest)
+                nperseg_values = sorted(list(set(nperseg_values)))
     
     # Select 3 overlap ratios: low (0.5), medium (0.75), high (0.9375)
     overlap_values = [0.5, 0.75, 0.9375]
     
-    # Select 3 nfft values: small, default, large
+    # Select 3 nfft values: ensure all are >= max(nperseg_values) to guarantee 27 combinations
     nfft_options = [256, 512, 1024, 2048]
+    max_nperseg = max(nperseg_values)
+    
+    # CRITICAL: Only select nfft values >= max_nperseg to ensure all combinations are valid
+    # This guarantees that for all nperseg values, all nfft values will be valid (nfft >= nperseg)
+    valid_nfft_options = [n for n in nfft_options if n >= max_nperseg]
+    
+    # If we don't have enough valid options (>= max_nperseg), we need to expand nfft_options
+    if len(valid_nfft_options) < 3:
+        # Try to find more options by checking larger values
+        larger_options = [n for n in [4096, 8192] if n >= max_nperseg]
+        valid_nfft_options.extend(larger_options)
+        valid_nfft_options = sorted(list(set(valid_nfft_options)))
+    
+    # Select 3 nfft values around default, but ensure they're all >= max_nperseg
     nfft_values = []
-    if default_nfft in nfft_options:
-        # Find indices around default
-        default_idx = nfft_options.index(default_nfft)
-        if default_idx == 0:
-            nfft_values = [nfft_options[0], nfft_options[1], nfft_options[2]]
-        elif default_idx == len(nfft_options) - 1:
-            nfft_values = [nfft_options[-3], nfft_options[-2], nfft_options[-1]]
+    if len(valid_nfft_options) >= 3:
+        # We have enough options >= max_nperseg
+        if default_nfft >= max_nperseg and default_nfft in valid_nfft_options:
+            # Default is valid, use it as center
+            default_idx = valid_nfft_options.index(default_nfft)
+            if default_idx == 0:
+                nfft_values = valid_nfft_options[:3]
+            elif default_idx == len(valid_nfft_options) - 1:
+                nfft_values = valid_nfft_options[-3:]
+            else:
+                start = max(0, default_idx - 1)
+                end = min(len(valid_nfft_options), start + 3)
+                nfft_values = valid_nfft_options[start:end]
+                if len(nfft_values) < 3:
+                    nfft_values = valid_nfft_options[:3]
         else:
-            nfft_values = [nfft_options[default_idx-1], nfft_options[default_idx], nfft_options[default_idx+1]]
+            # Default not valid (too small), use first 3 valid options
+            nfft_values = valid_nfft_options[:3]
     else:
-        # Default not in options, use first 3
-        nfft_values = nfft_options[:3]
+        # Not enough options >= max_nperseg, use what we have
+        nfft_values = valid_nfft_options
+    
+    # Ensure we have exactly 3 nfft values, all >= max_nperseg
+    if len(nfft_values) < 3:
+        # This should not happen if max_nperseg is reasonable, but handle it
+        # Try to use larger nfft values
+        min_needed = max_nperseg
+        larger_nfft = [n for n in nfft_options if n >= min_needed and n not in nfft_values]
+        nfft_values.extend(larger_nfft[:3 - len(nfft_values)])
+        nfft_values = sorted(nfft_values)
+        
+        # If still not enough, we have a problem - but try to proceed
+        if len(nfft_values) < 3:
+            print(f"WARNING: Only {len(nfft_values)} valid nfft values found for max_nperseg={max_nperseg}")
+            print(f"  This will result in fewer than 27 combinations!")
     
     # Generate all 3×3×3 = 27 settings
     selected = []
