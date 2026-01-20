@@ -222,18 +222,6 @@ def load_lee2019_mi(data_dir: str, num_seen: int = 40, seed: int = 44) -> Dict:
 
 # ==================== Lee2019 SSVEP Data Loading ====================
 
-class Lee2019_SSVEP(Dataset):
-    def __init__(self, data, labels, subject_ids):
-        self.data = torch.FloatTensor(data)
-        self.labels = torch.LongTensor(labels)
-        self.subject_ids = np.array(subject_ids)
-
-    def __len__(self):
-        return len(self.labels)
-
-    def __getitem__(self, idx):
-        return self.data[idx], self.labels[idx]
-
 def load_lee2019_ssvep(data_dir: str, num_seen: int = 40, seed: int = 44) -> Dict:
     """
     Load Lee2019 SSVEP data with subject splitting.
