@@ -33,7 +33,7 @@ scale_net_path = os.path.join(os.path.dirname(__file__), '..', '..', 'scale-net'
 sys.path.insert(0, scale_net_path)
 
 # Import from scale-net
-from train_scale_net import train_task, SCALENet
+from train_scale_net_v2 import train_task, SCALENet
 from dataset import TASK_CONFIGS, load_dataset, create_dataloaders
 
 

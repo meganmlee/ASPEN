@@ -1,15 +1,15 @@
 """
-Standalone Fusion Ablation Study for EEG Classification
+Fusion Ablation Study for EEG Classification using AdaptiveSCALENet Architecture
 
-Self-contained script to test 6 different fusion strategies:
+Uses AdaptiveSCALENet architecture (with ResNet blocks) from scale_net_adaptive_v2.py
+and tests 7 different fusion strategies:
 1. static - Equal 0.5/0.5 weighting
 2. global_attention - Trial-level dynamic weighting
 3. spatial_attention - Channel-level dynamic weighting  
 4. glu - Gated Linear Unit (noise suppression)
 5. multiplicative - Element-wise feature interaction
 6. bilinear - Full pairwise interaction
-
-No dependencies on other model files - completely standalone!
+7. transformer - Cross-attention with global weighting (from AdaptiveSCALENet)
 """
 
 import torch
@@ -26,49 +26,36 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import mne
 
-# Import only utilities (assumed available)
-scale_net_path = os.path.join(os.path.dirname(__file__), '..', '..', 'scale_net')
+# Import utilities from scale-net
+scale_net_path = os.path.join(os.path.dirname(__file__), '..', '..', 'scale-net')
 sys.path.insert(0, scale_net_path)
 
-# Import from scale-net
 from seed_utils import seed_everything
 from dataset import load_dataset, TASK_CONFIGS, create_dataloaders
 
-# ==================== SE Block ====================
-
-class SqueezeExcitation(nn.Module):
-    """Squeeze-and-Excitation Block"""
-    def __init__(self, channels, reduction=4):
-        super().__init__()
-        reduced = max(channels // reduction, 4)
-        self.squeeze = nn.AdaptiveAvgPool2d(1)
-        self.excitation = nn.Sequential(
-            nn.Linear(channels, reduced, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(reduced, channels, bias=False),
-            nn.Sigmoid()
-        )
-    
-    def forward(self, x):
-        b, c, _, _ = x.size()
-        y = self.squeeze(x).view(b, c)
-        y = self.excitation(y).view(b, c, 1, 1)
-        return x * y.expand_as(x)
+# Import AdaptiveSCALENet components from scale_net_adaptive_v2
+from scale_net_adaptive_v2 import (
+    SqueezeExcitation,
+    SpectralResidualBlock,
+    TransformerCrossFusion,
+    AdaptiveSCALENet
+)
 
 
 # ==================== Fusion Strategies ====================
 
 class FusionAblations(nn.Module):
     """
-    Implements 6 strategies for multimodal fusion ablation:
+    Implements 7 strategies for multimodal fusion ablation:
     1. 'static': Linear equal weighting (0.5/0.5)
     2. 'global_attention': Trial-level dynamic weighting
     3. 'spatial_attention': Channel-level dynamic weighting
     4. 'glu': Gated Linear Unit for noise suppression
     5. 'multiplicative': Simple element-wise product interaction
     6. 'bilinear': Full pairwise feature interaction
+    7. 'transformer': Cross-attention with global weighting (from AdaptiveSCALENet)
     """
-    def __init__(self, mode, dim, n_channels=None, temperature=2.0, rank=16):
+    def __init__(self, mode, dim, n_channels=None, temperature=2.0, rank=16, num_heads=4, dropout=0.1):
         super().__init__()
         self.mode = mode
         self.dim = dim
@@ -90,6 +77,14 @@ class FusionAblations(nn.Module):
             self.U_s = nn.Linear(dim, rank, bias=False)
             self.U_t = nn.Linear(dim, rank, bias=False)
             self.out_proj = nn.Linear(rank, dim)
+        elif mode == 'transformer':
+            # Use TransformerCrossFusion from scale_net_adaptive_v2
+            self.transformer_fusion = TransformerCrossFusion(
+                dim=dim,
+                num_heads=num_heads,
+                dropout=dropout,
+                temperature=temperature
+            )
 
     def forward(self, x_s, x_t):
         if self.mode == 'static':
@@ -125,47 +120,64 @@ class FusionAblations(nn.Module):
             z = z_s * z_t            # Element-wise product
             fused = self.out_proj(z) # (B, C, dim)
             return fused, None
+        
+        elif self.mode == 'transformer':
+            # Use TransformerCrossFusion - returns (fused, weights)
+            return self.transformer_fusion(x_s, x_t)
 
 
-# ==================== Dual-Stream EEG Model ====================
+# ==================== AdaptiveSCALENet with Configurable Fusion ====================
 
-class DualStreamEEGModel(nn.Module):
+class AdaptiveSCALENetWithFusion(nn.Module):
     """
-    Dual-stream EEG model with configurable fusion strategy
+    AdaptiveSCALENet architecture with configurable fusion strategy for ablation study.
+    
+    Uses the same architecture as AdaptiveSCALENet (ResNet blocks, etc.) but allows
+    swapping the fusion layer with different strategies from FusionAblations.
     
     Architecture:
-    - Spectral Stream: 2D CNN on STFT features
+    - Spectral Stream: 2D CNN with ResNet blocks on STFT features
     - Temporal Stream: EEGNet-style 1D CNN on raw EEG
-    - Fusion: One of 6 strategies (configurable)
+    - Fusion: One of 7 strategies (configurable)
     - LSTM: Temporal aggregation across channels
     - Classifier: Final prediction
     """
     
     def __init__(self, freq_bins, time_bins, n_channels, n_classes, T_raw,
                  cnn_filters=16, lstm_hidden=128, pos_dim=16,
-                 dropout=0.3, cnn_dropout=0.2, use_hidden_layer=False, hidden_dim=64,
-                 fusion_mode='global_attention', fusion_temperature=2.0, fusion_rank=16):
+                 dropout=0.4, cnn_dropout=0.25, use_hidden_layer=False, hidden_dim=64,
+                 fusion_mode='transformer', fusion_temperature=2.0, fusion_rank=16):
         
         super().__init__()
         self.n_channels = n_channels
         self.T_raw = T_raw
         self.fusion_mode = fusion_mode
         
-        # ====== SPECTRAL STREAM (2D CNN) ======
+        # ====== SPECTRAL STREAM (2D CNN with ResNet Blocks) ======
         self.spec_cnn_filters = cnn_filters * 2
         
-        # Stage 1: Conv(1→16) + BN + ReLU + SE + Dropout + Pool
+        # Stage 1: Initial Conv + ResNet Blocks
         self.spec_conv1 = nn.Conv2d(1, cnn_filters, kernel_size=7, padding=3, bias=False)
         self.spec_bn1 = nn.BatchNorm2d(cnn_filters)
         self.spec_se1 = SqueezeExcitation(cnn_filters, reduction=4)
         self.spec_dropout_cnn1 = nn.Dropout2d(cnn_dropout)
+        
+        # Add ResNet blocks for Stage 1 (from AdaptiveSCALENet)
+        self.spec_res1 = SpectralResidualBlock(cnn_filters, dropout=cnn_dropout)
+        self.spec_res2 = SpectralResidualBlock(cnn_filters, dropout=cnn_dropout)
+        
         self.spec_pool1 = nn.MaxPool2d(2)
         
-        # Stage 2: Conv(16→32) + BN + ReLU + SE + Dropout + Pool
+        # Stage 2: Conv + ResNet Blocks
         self.spec_conv2 = nn.Conv2d(cnn_filters, self.spec_cnn_filters, kernel_size=5, padding=2, bias=False)
         self.spec_bn2 = nn.BatchNorm2d(self.spec_cnn_filters)
         self.spec_se2 = SqueezeExcitation(self.spec_cnn_filters, reduction=4)
         self.spec_dropout_cnn2 = nn.Dropout2d(cnn_dropout)
+        
+        # Add ResNet blocks for Stage 2 (from AdaptiveSCALENet)
+        self.spec_res3 = SpectralResidualBlock(self.spec_cnn_filters, dropout=cnn_dropout)
+        self.spec_res4 = SpectralResidualBlock(self.spec_cnn_filters, dropout=cnn_dropout)
+        
         self.spec_pool2 = nn.MaxPool2d(2)
         
         # Spectral CNN Output Dimension
@@ -199,9 +211,15 @@ class DualStreamEEGModel(nn.Module):
         final_time_dim = (T_raw // 4) // 8
         self.time_out_dim = F2 * final_time_dim
 
-        # ====== FEATURE PROJECTION ======
-        self.proj_spec = nn.Linear(self.spec_out_dim, lstm_hidden)
-        self.proj_time = nn.Linear(self.time_out_dim, lstm_hidden)
+        # ====== FEATURE PROJECTION (with Dropout like AdaptiveSCALENet) ======
+        self.proj_spec = nn.Sequential(
+            nn.Linear(self.spec_out_dim, lstm_hidden),
+            nn.Dropout(0.2)
+        )
+        self.proj_time = nn.Sequential(
+            nn.Linear(self.time_out_dim, lstm_hidden),
+            nn.Dropout(0.2)
+        )
 
         # ====== FUSION LAYER ======
         self.fusion_layer = FusionAblations(
@@ -209,7 +227,9 @@ class DualStreamEEGModel(nn.Module):
             dim=lstm_hidden,
             n_channels=n_channels,
             temperature=fusion_temperature,
-            rank=fusion_rank
+            rank=fusion_rank,
+            num_heads=4,
+            dropout=dropout
         )
 
         # Channel Position Embedding
@@ -252,43 +272,47 @@ class DualStreamEEGModel(nn.Module):
     def forward(self, x_time, x_spec, chan_ids=None):
         B, C, _, _ = x_spec.shape
 
-        # ====== 1. SPECTRAL STREAM ======
-        x_spec_feat = x_spec.view(B * C, 1, x_spec.size(2), x_spec.size(3))
+        # ====== 1. SPECTRAL STREAM (with ResNet Blocks) ======
+        x_s = x_spec.view(B * C, 1, x_spec.size(2), x_spec.size(3))
         
-        # Stage 1
-        x_spec_feat = self.spec_conv1(x_spec_feat)
-        x_spec_feat = self.spec_bn1(x_spec_feat)
-        x_spec_feat = F.relu(x_spec_feat, inplace=True)
-        x_spec_feat = self.spec_se1(x_spec_feat)
-        x_spec_feat = self.spec_dropout_cnn1(x_spec_feat)
-        x_spec_feat = self.spec_pool1(x_spec_feat)
+        # Stage 1: Initial conv + SE + Dropout
+        x_s = self.spec_conv1(x_s)
+        x_s = F.relu(self.spec_bn1(x_s))
+        x_s = self.spec_se1(x_s)
+        x_s = self.spec_dropout_cnn1(x_s)
         
-        # Stage 2
-        x_spec_feat = self.spec_conv2(x_spec_feat)
-        x_spec_feat = self.spec_bn2(x_spec_feat)
-        x_spec_feat = F.relu(x_spec_feat, inplace=True)
-        x_spec_feat = self.spec_se2(x_spec_feat)
-        x_spec_feat = self.spec_dropout_cnn2(x_spec_feat)
-        x_spec_feat = self.spec_pool2(x_spec_feat)
+        # Stage 1: ResNet blocks (improves gradient flow)
+        x_s = self.spec_res1(x_s)
+        x_s = self.spec_res2(x_s)
         
-        x_spec_feat = x_spec_feat.view(B, C, -1)
+        # Stage 1: Pool
+        x_s = self.spec_pool1(x_s)
+        
+        # Stage 2: Conv + SE + Dropout
+        x_s = self.spec_conv2(x_s)
+        x_s = F.relu(self.spec_bn2(x_s))
+        x_s = self.spec_se2(x_s)
+        x_s = self.spec_dropout_cnn2(x_s)
+        
+        # Stage 2: ResNet blocks
+        x_s = self.spec_res3(x_s)
+        x_s = self.spec_res4(x_s)
+        
+        # Stage 2: Pool
+        x_s = self.spec_pool2(x_s)
+        
+        x_spec_feat = x_s.view(B, C, -1)
 
         # ====== 2. TEMPORAL STREAM ======
         x_global = x_time.unsqueeze(1)
-        
-        x_global = self.temp_conv(x_global)
-        x_global = self.bn_temp(x_global)
-        
-        x_global = self.spatial_conv(x_global)
-        x_global = F.relu(self.bn_spatial(x_global))
-        x_global = self.pool_spatial(x_global)
-        
+        x_global = self.bn_temp(self.temp_conv(x_global))
+        x_global = self.pool_spatial(F.relu(self.bn_spatial(self.spatial_conv(x_global))))
         x_global = self.separable_conv(x_global)
         x_global = x_global.view(B, -1)
         
         # ====== 3. FEATURE PROJECTION ======
         x_spec_proj = self.proj_spec(x_spec_feat)  # (B, C, lstm_hidden)
-        x_global_proj = self.proj_time(x_global.unsqueeze(1).expand(-1, C, -1))  # (B, C, lstm_hidden)
+        x_global_proj = self.proj_time(x_global).unsqueeze(1).expand(-1, C, -1)  # (B, C, lstm_hidden)
         
         # ====== 4. FUSION ======
         features, weights = self.fusion_layer(x_spec_proj, x_global_proj)
@@ -491,7 +515,7 @@ def collect_feature_statistics(model, loader, device, fusion_mode):
         'confidences': []
     }
     
-    if fusion_mode in ['global_attention', 'spatial_attention']:
+    if fusion_mode in ['global_attention', 'spatial_attention', 'transformer']:
         stats['attn_weights'] = []
     if fusion_mode == 'spatial_attention':
         stats['spatial_weights'] = []
@@ -505,33 +529,42 @@ def collect_feature_statistics(model, loader, device, fusion_mode):
             B, C = x_spec.shape[0], x_spec.shape[1]
             
             # Get projected features manually to calculate contributions
+            # Spectral stream with ResNet blocks
             x_spec_f = x_spec.view(B * C, 1, x_spec.size(2), x_spec.size(3))
             x_spec_f = model.spec_conv1(x_spec_f)
-            x_spec_f = model.spec_bn1(x_spec_f)
-            x_spec_f = F.relu(x_spec_f)
+            x_spec_f = F.relu(model.spec_bn1(x_spec_f))
             x_spec_f = model.spec_se1(x_spec_f)
+            x_spec_f = model.spec_dropout_cnn1(x_spec_f)
+            # ResNet blocks Stage 1
+            x_spec_f = model.spec_res1(x_spec_f)
+            x_spec_f = model.spec_res2(x_spec_f)
             x_spec_f = model.spec_pool1(x_spec_f)
+            # Stage 2
             x_spec_f = model.spec_conv2(x_spec_f)
-            x_spec_f = model.spec_bn2(x_spec_f)
-            x_spec_f = F.relu(x_spec_f)
+            x_spec_f = F.relu(model.spec_bn2(x_spec_f))
             x_spec_f = model.spec_se2(x_spec_f)
+            x_spec_f = model.spec_dropout_cnn2(x_spec_f)
+            # ResNet blocks Stage 2
+            x_spec_f = model.spec_res3(x_spec_f)
+            x_spec_f = model.spec_res4(x_spec_f)
             x_spec_f = model.spec_pool2(x_spec_f)
             x_spec_proj = model.proj_spec(x_spec_f.view(B, C, -1))
             
+            # Temporal stream
             x_g = x_time.unsqueeze(1)
-            x_g = model.temp_conv(x_g)
-            x_g = model.bn_temp(x_g)
-            x_g = model.spatial_conv(x_g)
-            x_g = F.relu(model.bn_spatial(x_g))
-            x_g = model.pool_spatial(x_g)
+            x_g = model.bn_temp(model.temp_conv(x_g))
+            x_g = model.pool_spatial(F.relu(model.bn_spatial(model.spatial_conv(x_g))))
             x_g = model.separable_conv(x_g)
-            x_global_proj = model.proj_time(x_g.view(B, -1).unsqueeze(1).expand(-1, C, -1))
+            x_global_proj = model.proj_time(x_g.view(B, -1)).unsqueeze(1).expand(-1, C, -1)
             
             _, weights = model.fusion_layer(x_spec_proj, x_global_proj)
 
             if fusion_mode == 'spatial_attention' and weights is not None:
                 # weights shape is (B, C, 2) - take spectral weights
                 stats['spatial_weights'].append(weights[:, :, 0].cpu().numpy())
+            elif fusion_mode == 'transformer' and weights is not None:
+                # transformer weights shape is (B, 2) - [Spectral, Temporal]
+                stats['attn_weights'].append(weights.cpu().numpy())
             
             # Calculate contribution magnitudes
             spec_mag = torch.norm(x_spec_proj, dim=-1)
@@ -758,7 +791,7 @@ def run_ablation_study(task: str, config: Dict = None):
         task: Task name (e.g., 'SSVEP', 'P300', 'MI', etc.)
         config: Configuration dictionary with training/model parameters
     """
-    strategies = ['static', 'global_attention', 'spatial_attention', 'glu', 'multiplicative', 'bilinear']
+    strategies = ['static', 'global_attention', 'spatial_attention', 'glu', 'multiplicative', 'bilinear', 'transformer']
     
     if config is None:
         config = {
@@ -833,7 +866,7 @@ def run_ablation_study(task: str, config: Dict = None):
         print(f"Spectral: {freq_bins}x{time_bins}, Temporal: {T_raw} samples")
         
         # Create model
-        model = DualStreamEEGModel(
+        model = AdaptiveSCALENetWithFusion(
             freq_bins=freq_bins,
             time_bins=time_bins,
             n_channels=n_channels,
