@@ -1,8 +1,8 @@
 """
 AdaptiveSCALENet - Adaptive SCALE-Net Model for Multi-Task EEG Classification
-Supports: SSVEP, P300, MI (Motor Imagery), Imagined Speech
 
-Dual-stream architecture with adaptive fusion strategies
+Supports: SSVEP, P300, MI (Motor Imagery), Imagined Speech
+Dual-stream architecture with global attention fusion
 """
 
 import torch
@@ -14,18 +14,73 @@ import os
 import pandas as pd
 from typing import Optional, Dict, Tuple
 from seed_utils import seed_everything
-from sklearn.metrics import f1_score, recall_score, roc_auc_score
+from sklearn.metrics import f1_score, recall_score, roc_auc_score, average_precision_score, precision_recall_curve, precision_score
+from torch.utils.data import WeightedRandomSampler
 
 # Import from dataset.py
 from dataset import (
-    load_dataset, 
-    TASK_CONFIGS, 
-    EEGDataset, 
+    load_dataset,
+    TASK_CONFIGS,
+    EEGDataset,
     create_dataloaders,
 )
 
-# ==================== SE Block ====================
 
+# ==================== Focal Loss ====================
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for addressing class imbalance in binary classification.
+    
+    FL(p_t) = -alpha * (1 - p_t)^gamma * log(p_t)
+    
+    Args:
+        alpha: Weighting factor for rare class (default: 0.5 when using WeightedRandomSampler)
+        gamma: Focusing parameter (default: 1.5)
+        reduction: 'mean' or 'sum' (default: 'mean')
+    """
+    def __init__(self, alpha=0.5, gamma=1.5, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+    
+    def forward(self, inputs, targets):
+        """
+        Args:
+            inputs: (N, 1) or (N,) - logits from model
+            targets: (N, 1) or (N,) - binary labels (0 or 1)
+        """
+        # Ensure inputs and targets are the right shape
+        if inputs.dim() > 1:
+            inputs = inputs.squeeze(1)
+        if targets.dim() > 1:
+            targets = targets.squeeze(1)
+        
+        # Convert to float
+        targets = targets.float()
+        
+        # Compute BCE loss
+        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        
+        # Compute p_t
+        pt = torch.exp(-bce_loss)  # p_t when target=1, 1-p_t when target=0
+        
+        # Compute alpha_t
+        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        
+        # Compute focal loss
+        focal_loss = alpha_t * (1 - pt) ** self.gamma * bce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+
+# ==================== SE Block ====================
 class SqueezeExcitation(nn.Module):
     """
     Squeeze-and-Excitation Block
@@ -40,130 +95,74 @@ class SqueezeExcitation(nn.Module):
             nn.Linear(reduced, channels, bias=False),
             nn.Sigmoid()
         )
-    
+
     def forward(self, x):
         b, c, _, _ = x.size()
         y = self.squeeze(x).view(b, c)
         y = self.excitation(y).view(b, c, 1, 1)
         return x * y.expand_as(x)
 
-class FusionAblations(nn.Module):
+
+class GlobalAttentionFusion(nn.Module):
     """
-    Implements 6 strategies for multimodal fusion ablation:
-    1. 'static': Linear equal weighting (0.5/0.5)
-    2. 'global_attention': Trial-level dynamic weighting
-    3. 'spatial_attention': Channel-level dynamic weighting
-    4. 'glu': Gated Linear Unit for noise suppression
-    5. 'multiplicative': Simple element-wise product interaction
-    6. 'bilinear': Full pairwise feature interaction
+    Trial-level global attention fusion.
+    Dynamically weights spectral and temporal streams per trial.
     """
-    def __init__(self, mode, dim, n_channels=None, temperature=2.0):
+    def __init__(self, dim, temperature=2.0):
         super().__init__()
-        self.mode = mode
         self.dim = dim
         self.temperature = temperature
         
-        if mode == 'global_attention' or mode == 'spatial_attention':
-            self.attn = nn.Sequential(nn.Linear(dim*2, dim), nn.ReLU(), nn.Linear(dim, 2))
-        elif mode == 'glu':
-            self.gate = nn.Linear(dim, dim)
-        elif mode == 'multiplicative':
-            self.proj_s = nn.Linear(dim, dim)
-            self.proj_t = nn.Linear(dim, dim)
-        elif mode == 'bilinear':
-            self.bilinear = nn.Bilinear(dim, dim, dim)
+        # Simple MLP to determine weights for [Spectral, Temporal]
+        self.attn = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.ReLU(),
+            nn.Linear(dim, 2)
+        )
 
     def forward(self, x_s, x_t):
-        if self.mode == 'static':
-            return 0.5 * x_s + 0.5 * x_t, None
-            
-        elif self.mode == 'global_attention':
-            ctx = torch.cat([x_s.mean(1), x_t.mean(1)], dim=-1)
-            attn_logits = self.attn(ctx) / self.temperature
-            w = torch.softmax(attn_logits, dim=-1)
-            return w[:, 0].view(-1, 1, 1) * x_s + w[:, 1].view(-1, 1, 1) * x_t, w
-            
-        elif self.mode == 'spatial_attention':
-            ctx = torch.cat([x_s, x_t], dim=-1)
-            attn_logits = self.attn(ctx) / self.temperature
-            w = torch.softmax(attn_logits, dim=-1)
-            return w[:, :, 0].unsqueeze(-1) * x_s + w[:, :, 1].unsqueeze(-1) * x_t, w
-            
-        elif self.mode == 'glu':
-            combined = x_s + x_t
-            gate_val = torch.sigmoid(self.gate(combined))
-            return combined * gate_val, gate_val
+        # Average across channels to get trial-level context
+        ctx = torch.cat([x_s.mean(1), x_t.mean(1)], dim=-1)  # (B, dim*2)
+        
+        # Calculate attention weights
+        attn_logits = self.attn(ctx) / self.temperature
+        w = torch.softmax(attn_logits, dim=-1)  # (B, 2)
+        
+        # Apply weights to Spectral (0) and Temporal (1) streams
+        res = w[:, 0].view(-1, 1, 1) * x_s + w[:, 1].view(-1, 1, 1) * x_t
+        return res, w
 
-        elif self.mode == 'multiplicative':
-            return self.proj_s(x_s) * self.proj_t(x_t), None
-            
-        elif self.mode == 'bilinear':
-            B, C, D = x_s.shape
-            res = self.bilinear(x_s.view(-1, D), x_t.view(-1, D))
-            return res.view(B, C, D), None
-
-
-class AttentionFusion(nn.Module):
-    """
-    Legacy attention fusion (equivalent to 'global_attention' with projection).
-    Kept for backward compatibility.
-    """
-    def __init__(self, spec_dim, time_dim, out_dim):
-        super().__init__()
-        self.spec_proj = nn.Linear(spec_dim, out_dim)
-        self.time_proj = nn.Linear(time_dim, out_dim)
-        
-        # Attention mechanism
-        self.attention = nn.Sequential(
-            nn.Linear(out_dim * 2, out_dim),
-            nn.Tanh(),
-            nn.Linear(out_dim, 2), # Outputs weights for [Spec, Time]
-            nn.Softmax(dim=1)
-        )
-        
-    def forward(self, x_spec, x_time):
-        # Project both to same dimension
-        # x_spec: (B, C, spec_dim)
-        # x_time: (B, C, time_dim) (We expanded time feats to C channels)
-        
-        feat_spec = self.spec_proj(x_spec)
-        feat_time = self.time_proj(x_time)
-        
-        # Calculate attention weights per trial (Global Average Pooling context)
-        # We average over Channels to get a general "trial state"
-        ctx_spec = feat_spec.mean(dim=1) # (B, out_dim)
-        ctx_time = feat_time.mean(dim=1) # (B, out_dim)
-        ctx = torch.cat([ctx_spec, ctx_time], dim=1) # (B, out_dim*2)
-        
-        weights = self.attention(ctx) # (B, 2)
-        w_spec = weights[:, 0].view(-1, 1, 1) # (B, 1, 1)
-        w_time = weights[:, 1].view(-1, 1, 1) # (B, 1, 1)
-        
-        # Weighted sum (Fusion)
-        fused = (w_spec * feat_spec) + (w_time * feat_time)
-        return fused, weights
 
 class AdaptiveSCALENet(nn.Module):
     """
-    Adaptive SCALE-Net: Dual-stream architecture with adaptive fusion strategies
+    Adaptive SCALE-Net: Dual-stream architecture with global attention fusion
     
-    Combines spectral (STFT) and temporal (raw) streams with configurable fusion methods.
+    Combines spectral (STFT) and temporal (raw) streams with adaptive trial-level weighting.
     
     Inputs:
         x_time: (B, C, T_raw) - Raw temporal EEG data
         x_spec: (B, C, F, T) - STFT features
     """
-    
-    def __init__(self, freq_bins, time_bins, n_channels, n_classes, T_raw,
-                 cnn_filters=16, lstm_hidden=128, pos_dim=16,
-                 dropout=0.3, cnn_dropout=0.2, use_hidden_layer=False, hidden_dim=64,
-                 fusion_mode='global_attention', fusion_temperature=2.0):
-        
+    def __init__(self,
+                 freq_bins,
+                 time_bins,
+                 n_channels,
+                 n_classes,
+                 T_raw,
+                 cnn_filters=16,
+                 lstm_hidden=128,
+                 pos_dim=16,
+                 dropout=0.5,
+                 cnn_dropout=0.3,
+                 use_hidden_layer=False,
+                 hidden_dim=64,
+                 fusion_temperature=2.0):
         super().__init__()
+        
         self.n_channels = n_channels
         self.T_raw = T_raw
         
-        # ====== SPECTRAL STREAM (2D CNN) - Same as original model ======
+        # ====== SPECTRAL STREAM (2D CNN) ======
         self.spec_cnn_filters = cnn_filters * 2
         
         # Stage 1: Conv(1→16) + BN + ReLU + SE + Dropout + Pool
@@ -184,69 +183,56 @@ class AdaptiveSCALENet(nn.Module):
         self.spec_out_dim = (freq_bins // 4) * (time_bins // 4) * self.spec_cnn_filters
         
         # ====== TEMPORAL STREAM (EEGNet Inspired) ======
-        F1 = 8  # F1 filters per temporal kernel
-        D = 2   # Depth multiplier (Spatial filters per temporal filter)
+        F1 = 8   # F1 filters per temporal kernel
+        D = 2    # Depth multiplier (Spatial filters per temporal filter)
         F2 = F1 * D
         
         # Layer 1: Temporal Conv (Kernels along Time)
-        # Input: (B, 1, C, T) -> Output: (B, F1, C, T)
         self.temp_conv = nn.Conv2d(1, F1, (1, 64), padding=(0, 32), bias=False)
         self.bn_temp = nn.BatchNorm2d(F1)
         
-        # Layer 2: Spatial Conv (Kernels along Channels)
-        # Input: (B, F1, C, T) -> Output: (B, F2, 1, T)
-        # GROUPS=F1 makes this a Depthwise convolution (crucial for EEGNet)
+        # Layer 2: Spatial Conv (Kernels along Channels) - Depthwise
         self.spatial_conv = nn.Conv2d(F1, F2, (n_channels, 1), groups=F1, bias=False)
         self.bn_spatial = nn.BatchNorm2d(F2)
-        self.pool_spatial = nn.AvgPool2d((1, 4)) # Pool time by 4
+        self.pool_spatial = nn.AvgPool2d((1, 4))
         
         # Layer 3: Separable Conv
         self.separable_conv = nn.Sequential(
-            nn.Conv2d(F2, F2, (1, 16), padding=(0, 8), groups=F2, bias=False), # Depthwise
-            nn.Conv2d(F2, F2, (1, 1), bias=False), # Pointwise
+            nn.Conv2d(F2, F2, (1, 16), padding=(0, 8), groups=F2, bias=False),  # Depthwise
+            nn.Conv2d(F2, F2, (1, 1), bias=False),  # Pointwise
             nn.BatchNorm2d(F2),
             nn.ReLU(inplace=True),
-            nn.AvgPool2d((1, 8)), # Pool time aggressively
+            nn.AvgPool2d((1, 8)),
             nn.Dropout(cnn_dropout)
         )
         
-        # Calculate dimension after flattening the temporal stream
-        # This vector represents the "Global Context" of the trial
-        final_time_dim = (T_raw // 4) // 8 
+        # Calculate temporal stream output dimension
+        final_time_dim = (T_raw // 4) // 8
         self.time_out_dim = F2 * final_time_dim
-
+        
         # ====== FEATURE PROJECTION (for fusion) ======
-        # Project both streams to same dimension before fusion
-        self.proj_spec = nn.Linear(self.spec_out_dim, lstm_hidden)
-        self.proj_time = nn.Linear(self.time_out_dim, lstm_hidden)
-
-        # ====== FUSION LAYER ======
-        # Support multiple fusion strategies: 'static', 'global_attention', 'spatial_attention', 
-        # 'glu', 'multiplicative', 'bilinear'
-        # Default: 'global_attention' (equivalent to original AttentionFusion)
-        self.fusion_mode = fusion_mode
-        if fusion_mode == 'legacy' or fusion_mode == 'original':
-            # Use original AttentionFusion for backward compatibility
-            self.fusion_layer = AttentionFusion(self.spec_out_dim, self.time_out_dim, lstm_hidden)
-        else:
-            # Use FusionAblations with projection applied before fusion
-            self.fusion_layer = FusionAblations(
-                mode=fusion_mode, 
-                dim=lstm_hidden, 
-                n_channels=n_channels,
-                temperature=fusion_temperature
-            )
-
+        self.proj_spec = nn.Sequential(
+            nn.Linear(self.spec_out_dim, lstm_hidden),
+            nn.Dropout(0.3)
+        )
+        self.proj_time = nn.Sequential(
+            nn.Linear(self.time_out_dim, lstm_hidden),
+            nn.Dropout(0.3)
+        )
+        
+        # Global Attention Fusion
+        self.fusion_layer = GlobalAttentionFusion(dim=lstm_hidden, temperature=fusion_temperature)
+        
         # Channel Position Embedding
         self.chan_emb = nn.Embedding(n_channels, lstm_hidden)
-
+        
         # LSTM
         self.lstm = nn.LSTM(
-            input_size=lstm_hidden, # Projected dimension
+            input_size=lstm_hidden,
             hidden_size=lstm_hidden,
             batch_first=True,
             bidirectional=False,
-            dropout=0 
+            dropout=0
         )
         self.dropout_lstm = nn.Dropout(dropout)
         
@@ -261,8 +247,9 @@ class AdaptiveSCALENet(nn.Module):
             classifier_input = hidden_dim
         else:
             classifier_input = lstm_hidden
-            
-        self.classifier = nn.Linear(classifier_input, 1 if n_classes==2 else n_classes)
+        
+        self.classifier = nn.Linear(classifier_input, 1 if n_classes == 2 else n_classes)
+        
         self._init_weights()
 
     def _init_weights(self):
@@ -276,72 +263,45 @@ class AdaptiveSCALENet(nn.Module):
 
     def forward(self, x_time, x_spec, chan_ids: Optional[torch.Tensor] = None):
         B, C, _, _ = x_spec.shape
-        _, _, T_raw = x_time.shape
-
-        # ====== 1. SPECTRAL STREAM (2D CNN) ======
-        # (B, C, F, T) → (B*C, 1, F, T)
-        x_spec = x_spec.view(B * C, 1, x_spec.size(2), x_spec.size(3))
         
-        # Stage 1
-        x_spec = self.spec_conv1(x_spec); x_spec = self.spec_bn1(x_spec); x_spec = F.relu(x_spec, inplace=True)
-        x_spec = self.spec_se1(x_spec); x_spec = self.spec_dropout_cnn1(x_spec); x_spec = self.spec_pool1(x_spec)
+        # 1. Spectral Stream
+        x_s = x_spec.view(B * C, 1, x_spec.size(2), x_spec.size(3))
+        x_s = self.spec_pool1(self.spec_se1(F.relu(self.spec_bn1(self.spec_conv1(x_s)))))
+        x_s = self.spec_pool2(self.spec_se2(F.relu(self.spec_bn2(self.spec_conv2(x_s)))))
+        x_s = self.proj_spec(x_s.view(B, C, -1))
         
-        # Stage 2
-        x_spec = self.spec_conv2(x_spec); x_spec = self.spec_bn2(x_spec); x_spec = F.relu(x_spec, inplace=True)
-        x_spec = self.spec_se2(x_spec); x_spec = self.spec_dropout_cnn2(x_spec); x_spec = self.spec_pool2(x_spec)
+        # 2. Temporal Stream
+        x_t = self.separable_conv(
+            self.pool_spatial(
+                F.relu(self.bn_spatial(
+                    self.spatial_conv(
+                        self.bn_temp(self.temp_conv(x_time.unsqueeze(1)))
+                    )
+                ))
+            )
+        )
+        x_t = self.proj_time(x_t.view(B, -1)).unsqueeze(1).expand(-1, C, -1)
         
-        x_spec = x_spec.view(B, C, -1)  # (B, C, spec_out_dim)
-
-        # ====== 2. TEMPORAL STREAM (1D CNN) ======
-        # Input: (B, C, T) -> (B, 1, C, T) to use 2D Spatial Conv
-        x_global = x_time.unsqueeze(1) 
+        # 3. Global Attention Fusion
+        features, weights = self.fusion_layer(x_s, x_t)
         
-        x_global = self.temp_conv(x_global)
-        x_global = self.bn_temp(x_global)
-        
-        # Crucial Step: Spatial Conv reduces C dimension to 1
-        x_global = self.spatial_conv(x_global) 
-        x_global = F.relu(self.bn_spatial(x_global))
-        x_global = self.pool_spatial(x_global)
-        
-        x_global = self.separable_conv(x_global)
-        
-        # Flatten: (B, F2, 1, T_small) -> (B, F2*T_small)
-        x_global = x_global.view(B, -1)
-        
-        # ====== 3. FEATURE PROJECTION ======
-        # Project both streams to same dimension
-        x_spec_proj = self.proj_spec(x_spec)  # (B, C, lstm_hidden)
-        x_global_expanded = x_global.unsqueeze(1).expand(-1, C, -1)  # (B, C, time_out_dim)
-        x_time_proj = self.proj_time(x_global_expanded)  # (B, C, lstm_hidden)
-        
-        # ====== 4. FEATURE FUSION ======
-        # Apply fusion strategy
-        if self.fusion_mode == 'legacy' or self.fusion_mode == 'original':
-            # Original AttentionFusion (handles projection internally)
-            features, weights = self.fusion_layer(x_spec, x_global_expanded)
-        else:
-            # FusionAblations (projection already applied)
-            features, weights = self.fusion_layer(x_spec_proj, x_time_proj)  # (B, C, lstm_hidden)
-        
-        # Add Position Embeddings (Transformer style addition)
+        # 4. Channel Position Embedding
         if chan_ids is None:
             chan_ids = torch.arange(C, device=features.device).unsqueeze(0).expand(B, C)
-        pos = self.chan_emb(chan_ids) # (B, C, pos_dim)
-        features = features + pos
+        features = features + self.chan_emb(chan_ids)
         
-        # LSTM Aggregation
+        # 5. LSTM
         _, (h, _) = self.lstm(features)
-        h = h.squeeze(0)
-        h = self.dropout_lstm(h)
-
+        h = self.dropout_lstm(h.squeeze(0))
+        
+        # 6. Classifier
         if self.use_hidden_layer:
             h = self.hidden_layer(h)
         
         return self.classifier(h), weights
 
-# ==================== Multi-GPU Setup ====================
 
+# ==================== Multi-GPU Setup ====================
 def setup_device():
     """Setup device and return device info"""
     if torch.cuda.is_available():
@@ -373,6 +333,55 @@ def unwrap_model(model):
 
 # ==================== Training Functions ====================
 
+def find_best_threshold(y_true, y_prob, mode="f1"):
+    """
+    Find optimal threshold for binary classification
+    
+    Args:
+        y_true: True labels (numpy array)
+        y_prob: Predicted probabilities (numpy array)
+        mode: Optimization mode
+            - "f1": F1 score maximization
+            - "youden": TPR-FPR maximization (Youden's J statistic)
+            - "recall_at_precision": Maximize recall with precision >= 0.5
+    
+    Returns:
+        best_threshold, best_score
+    """
+    y_true = np.asarray(y_true).astype(int)
+    y_prob = np.asarray(y_prob).astype(float)
+
+    thresholds = np.linspace(0.01, 0.99, 99)
+    best_t, best_score = 0.5, -1.0
+
+    for t in thresholds:
+        y_pred = (y_prob >= t).astype(int)
+        if mode == "f1":
+            score = f1_score(y_true, y_pred, average="binary", zero_division=0)
+        elif mode == "youden":
+            tn = np.sum((y_pred == 0) & (y_true == 0))
+            fp = np.sum((y_pred == 1) & (y_true == 0))
+            tp = np.sum((y_pred == 1) & (y_true == 1))
+            fn = np.sum((y_pred == 0) & (y_true == 1))
+            tpr = tp / (tp + fn) if (tp + fn) > 0 else 0
+            fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
+            score = tpr - fpr
+        elif mode == "recall_at_precision":
+            prec = precision_score(y_true, y_pred, average="binary", zero_division=0)
+            if prec >= 0.5:
+                score = recall_score(y_true, y_pred, average="binary", zero_division=0)
+            else:
+                score = -1
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+        
+        if score > best_score:
+            best_score = score
+            best_t = t
+
+    return float(best_t), float(best_score)
+
+
 def train_epoch(model, loader, criterion, optimizer, device, is_binary=False):
     model.train()
     total_loss, correct, total = 0, 0, 0
@@ -384,25 +393,26 @@ def train_epoch(model, loader, criterion, optimizer, device, is_binary=False):
         
         # Convert labels for binary classification
         if is_binary:
-            labels_float = labels.float().unsqueeze(1)  # (B,) → (B, 1) for BCEWithLogitsLoss
+            labels_float = labels.float().unsqueeze(1)
         else:
             labels_float = labels
         
         optimizer.zero_grad()
         outputs, _ = model(x_time, x_spec)
         loss = criterion(outputs, labels_float)
-        
         loss.backward()
-        # Handle DataParallel case for gradient clipping
+        
+        # Gradient clipping
         actual_model = unwrap_model(model)
         torch.nn.utils.clip_grad_norm_(actual_model.parameters(), 1.0)
+        
         optimizer.step()
         
         total_loss += loss.item()
         
-        # Prediction: binary uses sigmoid threshold, multi-class uses argmax
+        # Prediction
         if is_binary:
-            pred = (torch.sigmoid(outputs) > 0.5).squeeze(1).long()  # (B, 1) → (B,)
+            pred = (torch.sigmoid(outputs) > 0.5).squeeze(1).long()
         else:
             _, pred = outputs.max(1)
         
@@ -414,7 +424,8 @@ def train_epoch(model, loader, criterion, optimizer, device, is_binary=False):
     return total_loss / len(loader), 100. * correct / total
 
 
-def evaluate(model, loader, device, criterion=None, is_binary=False, return_metrics=False):
+def evaluate(model, loader, device, criterion=None, is_binary=False, return_metrics=False,
+             threshold=0.5, optimize_threshold=False):
     """
     Evaluate model on a dataset
     
@@ -425,30 +436,32 @@ def evaluate(model, loader, device, criterion=None, is_binary=False, return_metr
         criterion: Loss function (optional)
         is_binary: Whether this is binary classification
         return_metrics: If True, return additional metrics (f1, recall, auc)
+        threshold: Threshold for binary classification (default: 0.5)
+        optimize_threshold: If True, find optimal threshold on validation set (only for binary)
     
     Returns:
         If return_metrics=False: (avg_loss, acc)
         If return_metrics=True: (avg_loss, acc, metrics_dict)
-            where metrics_dict contains 'f1', 'recall', 'auc' (if applicable)
+            where metrics_dict contains 'f1', 'recall', 'auc', 'pr_auc', 'threshold' (if applicable)
     """
     model.eval()
     total_loss, correct, total = 0.0, 0, 0
     all_preds = []
     all_labels = []
-    all_probs = []  # For AUC calculation
+    all_probs = []  # For AUC calculation and threshold optimization
     
     with torch.no_grad():
         for inputs, labels in tqdm(loader, desc='Eval', ncols=100):
             x_time, x_spec = inputs
             x_time, x_spec, labels = x_time.to(device), x_spec.to(device), labels.to(device)
             
-            # Convert labels for binary classification
             if is_binary:
-                labels_float = labels.float().unsqueeze(1)  # (B,) → (B, 1) for BCEWithLogitsLoss
+                labels_float = labels.float().unsqueeze(1)
             else:
                 labels_float = labels
             
             outputs, _ = model(x_time, x_spec)
+            
             if criterion is not None:
                 loss = criterion(outputs, labels_float)
                 total_loss += loss.item()
@@ -456,18 +469,19 @@ def evaluate(model, loader, device, criterion=None, is_binary=False, return_metr
             # Prediction: binary uses sigmoid threshold, multi-class uses argmax
             if is_binary:
                 probs = torch.sigmoid(outputs).squeeze(1)  # (B,)
-                pred = (probs > 0.5).long()  # (B,)
                 if return_metrics:
-                    all_probs.append(probs.cpu().numpy())
+                    all_probs.append(probs.detach().cpu().numpy())
+                # Use threshold for prediction (will be re-computed if optimize_threshold=True)
+                pred = (probs >= threshold).long()
             else:
                 probs = F.softmax(outputs, dim=1)  # (B, n_classes)
-                _, pred = outputs.max(1)
+                pred = outputs.argmax(1)
                 if return_metrics:
-                    all_probs.append(probs.cpu().numpy())
+                    all_probs.append(probs.detach().cpu().numpy())
             
             if return_metrics:
-                all_preds.append(pred.cpu().numpy())
-                all_labels.append(labels.cpu().numpy())
+                all_preds.append(pred.detach().cpu().numpy())
+                all_labels.append(labels.detach().cpu().numpy())
             
             total += labels.size(0)
             correct += pred.eq(labels).sum().item()
@@ -478,73 +492,58 @@ def evaluate(model, loader, device, criterion=None, is_binary=False, return_metr
     if not return_metrics:
         return avg_loss, acc
     
-    # Calculate additional metrics
-    all_preds = np.concatenate(all_preds)
+    # Concatenate all predictions and probabilities
     all_labels = np.concatenate(all_labels)
     all_probs = np.concatenate(all_probs)
+    
+    # Optimize threshold for binary classification if requested
+    best_thr = threshold
+    if is_binary and optimize_threshold:
+        best_thr, best_f1 = find_best_threshold(all_labels, all_probs, mode="f1")
+        # Recompute predictions with optimal threshold
+        all_preds = (all_probs >= best_thr).astype(int)
+    else:
+        all_preds = np.concatenate(all_preds)
     
     metrics = {}
     
     # F1 score (macro average for multi-class, binary for binary)
     if is_binary:
-        f1 = f1_score(all_labels, all_preds, average='binary', zero_division=0)
+        metrics["threshold"] = best_thr
+        metrics["f1"] = f1_score(all_labels, all_preds, average="binary", zero_division=0) * 100
+        metrics["recall"] = recall_score(all_labels, all_preds, average="binary", zero_division=0) * 100
+        metrics["precision"] = precision_score(all_labels, all_preds, average="binary", zero_division=0) * 100
+        metrics["auc"] = roc_auc_score(all_labels, all_probs) * 100
+        metrics["pr_auc"] = average_precision_score(all_labels, all_probs) * 100
     else:
-        f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
-    metrics['f1'] = f1 * 100  # Convert to percentage
-    
-    # Recall (macro average for multi-class, binary for binary)
-    if is_binary:
-        recall = recall_score(all_labels, all_preds, average='binary', zero_division=0)
-    else:
-        recall = recall_score(all_labels, all_preds, average='macro', zero_division=0)
-    metrics['recall'] = recall * 100  # Convert to percentage
-    
-    # AUC
-    try:
-        if is_binary:
-            # Binary classification: use probabilities directly
-            auc = roc_auc_score(all_labels, all_probs)
-            metrics['auc'] = auc * 100  # Convert to percentage
-        else:
-            # Multi-class: use sklearn's built-in multi-class AUC
-            n_classes = all_probs.shape[1]
-            if n_classes == 2:
-                # Binary case with 2 classes (use positive class probability)
-                auc = roc_auc_score(all_labels, all_probs[:, 1])
-                metrics['auc'] = auc * 100
+        metrics["f1"] = f1_score(all_labels, all_preds, average="macro", zero_division=0) * 100
+        metrics["recall"] = recall_score(all_labels, all_preds, average="macro", zero_division=0) * 100
+        # Multi-class AUC calculation (one-vs-rest)
+        try:
+            if all_probs.ndim == 2 and all_probs.shape[1] > 2:
+                from sklearn.preprocessing import label_binarize
+                y_bin = label_binarize(all_labels, classes=np.arange(all_probs.shape[1]))
+                if y_bin.shape[1] == 1:
+                    metrics["auc"] = roc_auc_score(all_labels, all_probs[:, 1]) * 100
+                else:
+                    metrics["auc"] = roc_auc_score(y_bin, all_probs, average='macro', multi_class='ovr') * 100
             else:
-                # Multi-class: use one-vs-rest (ovr) or one-vs-one (ovo) approach
-                # 'ovr' computes AUC for each class against the rest, then averages
-                # 'macro' averages the AUCs of each class
-                try:
-                    # Try one-vs-rest macro average
-                    auc = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='macro')
-                    metrics['auc'] = auc * 100
-                except ValueError:
-                    # Fallback: if some classes are missing, try weighted average
-                    try:
-                        auc = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='weighted')
-                        metrics['auc'] = auc * 100
-                    except ValueError:
-                        # If still fails, set to None
-                        metrics['auc'] = None
-    except (ValueError, IndexError) as e:
-        # If AUC calculation fails (e.g., only one class present), set to None
-        metrics['auc'] = None
+                metrics["auc"] = -1
+        except:
+            metrics["auc"] = -1
     
     return avg_loss, acc, metrics
 
 
-# ==================== Main Training ====================
+# ==================== Attention Weight Collection ====================
 def collect_weights(model, loader, device):
     """
     Runs an evaluation pass and collects the attention weights for every trial.
     
     Returns:
         weights_array: Shape (N, 2) where N is number of trials
-            - For global_attention: (B, 2) -> (N, 2) after concatenation
-            - For spatial_attention: (B, C, 2) -> average over channels -> (B, 2) -> (N, 2)
-            - For other modes: may return None or different shapes
+                      Column 0: Spectral weight
+                      Column 1: Temporal weight
     """
     model.eval()
     all_weights = []
@@ -554,33 +553,27 @@ def collect_weights(model, loader, device):
             x_time, x_spec = inputs
             x_time, x_spec = x_time.to(device), x_spec.to(device)
             
-            # Outputs is a 2-tuple, we only care about the second element (weights)
             _, weights = model(x_time, x_spec)
             
             if weights is not None:
                 weights_np = weights.cpu().numpy()
                 
-                # Handle different weight shapes based on fusion mode
+                # Handle different weight shapes
                 if weights_np.ndim == 2 and weights_np.shape[1] == 2:
                     # Global attention: (B, 2) - already in correct format
                     all_weights.append(weights_np)
                 elif weights_np.ndim == 3 and weights_np.shape[2] == 2:
-                    # Spatial attention: (B, C, 2) - average over channels to get (B, 2)
-                    weights_avg = weights_np.mean(axis=1)  # (B, C, 2) -> (B, 2)
+                    # Average over middle dimension if needed
+                    weights_avg = weights_np.mean(axis=1)
                     all_weights.append(weights_avg)
-                else:
-                    # Other modes or unexpected shapes - skip or handle appropriately
-                    # For static, glu, multiplicative, bilinear, weights may be None
-                    # Create dummy weights if needed
-                    B = weights_np.shape[0] if weights_np.ndim > 0 else 1
-                    dummy_weights = np.array([[0.5, 0.5]] * B)
-                    all_weights.append(dummy_weights)
     
     if len(all_weights) == 0:
         return None
     
     return np.concatenate(all_weights, axis=0)
 
+
+# ==================== Main Training ====================
 def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[str] = None) -> Tuple:
     """
     Train model for a specific EEG task
@@ -589,7 +582,7 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
         task: One of 'SSVEP', 'P300', 'MI', 'Imagined_speech'
         config: Training configuration (uses defaults if None)
         model_path: Path to save best model
-        
+    
     Returns:
         (model, results_dict)
     """
@@ -607,14 +600,13 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
             'cnn_filters': 16,
             'lstm_hidden': 128,
             'pos_dim': 16,
-            'dropout': 0.3,  # Dropout for LSTM output and classifier
-            'cnn_dropout': 0.2,  # Dropout for CNN layers (spatial dropout)
-            'use_hidden_layer': False,  # Whether to add hidden dense layer after LSTM
-            'hidden_dim': 64,  # Hidden layer dimension if use_hidden_layer=True
-            'fusion_mode': 'global_attention',  # Fusion strategy: 'static', 'global_attention', 'spatial_attention', 'glu', 'multiplicative', 'bilinear', 'legacy'
-            'fusion_temperature': 2.0,  # Temperature for attention-based fusion strategies
+            'dropout': 0.5,
+            'cnn_dropout': 0.3,
+            'use_hidden_layer': False,
+            'hidden_dim': 64,
+            'fusion_temperature': 2.0,
             
-            # STFT - Use task-specific parameters from TASK_CONFIGS
+            # STFT - Use task-specific parameters
             'stft_fs': task_config.get('sampling_rate', 250),
             'stft_nperseg': task_config.get('stft_nperseg', 128),
             'stft_noverlap': task_config.get('stft_noverlap', 112),
@@ -635,24 +627,24 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
         config.setdefault('stft_nperseg', task_config.get('stft_nperseg', 128))
         config.setdefault('stft_noverlap', task_config.get('stft_noverlap', 112))
         config.setdefault('stft_nfft', task_config.get('stft_nfft', 512))
-        config.setdefault('dropout', 0.3)
-        config.setdefault('cnn_dropout', 0.2)
+        config.setdefault('dropout', 0.5)
+        config.setdefault('cnn_dropout', 0.3)
         config.setdefault('use_hidden_layer', False)
         config.setdefault('hidden_dim', 64)
-        config.setdefault('scheduler', 'ReduceLROnPlateau')  # Default scheduler
-        config.setdefault('fusion_mode', 'global_attention')  # Default fusion strategy
-        config.setdefault('fusion_temperature', 2.0)  # Default temperature for attention
-
+        config.setdefault('scheduler', 'ReduceLROnPlateau')
+        config.setdefault('fusion_temperature', 2.0)
+    
     seed = config.get('seed', 44)
     seed_everything(seed, deterministic=True)
     
     # Setup device and multi-GPU
     device, n_gpus = setup_device()
+    
     print(f"\n{'='*70}")
     print(f"{task} Classification")
     print(f"{'='*70}")
     print(f"Device: {device}, GPUs: {n_gpus}")
-    print(f"Fusion Mode: {config.get('fusion_mode', 'global_attention')}")
+    print(f"Fusion: Global Attention (temperature={config.get('fusion_temperature', 2.0)})")
     
     # ====== Load Data ======
     datasets = load_dataset(
@@ -681,14 +673,34 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
     print(f"  nfft: {stft_config['nfft']}")
     print(f"  Frequency resolution: {stft_config['fs']/stft_config['nfft']:.2f} Hz/bin")
     
+    # Get n_classes for sampler creation
+    n_classes = config['n_classes']
+    
     # ====== Create Data Loaders ======
+    # For P300 tasks, use WeightedRandomSampler for balanced batches
+    train_sampler = None
+    if task in ['P300', 'BNCI2014_P300', 'BI2014b_P300'] and n_classes == 2:
+        train_labels = datasets['train'][1]
+        class_counts = np.bincount(train_labels)
+        class_weights = 1.0 / class_counts
+        sample_weights = class_weights[train_labels]
+        train_sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(train_labels),
+            replacement=True
+        )
+        print(f"\nUsing WeightedRandomSampler for balanced batches:")
+        print(f"  Class 0: {class_counts[0]} samples, weight: {class_weights[0]:.4f}")
+        print(f"  Class 1: {class_counts[1]} samples, weight: {class_weights[1]:.4f}")
+    
     loaders = create_dataloaders(
-        datasets, 
-        stft_config, 
+        datasets,
+        stft_config,
         batch_size=config['batch_size'],
         num_workers=4,
         augment_train=config.get('augment_train', True),
         seed=seed,
+        train_sampler=train_sampler
     )
     
     train_loader = loaders['train']
@@ -697,14 +709,15 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
     test2_loader = loaders.get('test2')
     
     # Get dimensions from a sample
-    sample_x, _ = next(iter(train_loader)) # Now returns (x_time, x_spec), labels
+    sample_x, _ = next(iter(train_loader))
     sample_x_time, sample_x_spec = sample_x
-    _, n_channels, T_raw = sample_x_time.shape # Get T_raw from the first element
+    _, n_channels, T_raw = sample_x_time.shape
     _, _, freq_bins, time_bins = sample_x_spec.shape
+    
     print(f"STFT shape: ({n_channels}, {freq_bins}, {time_bins})")
     
     # ====== Create Model ======
-    n_classes = config['n_classes']
+    # n_classes is already defined above
     model = AdaptiveSCALENet(
         freq_bins=freq_bins,
         time_bins=time_bins,
@@ -714,11 +727,10 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
         cnn_filters=config['cnn_filters'],
         lstm_hidden=config['lstm_hidden'],
         pos_dim=config['pos_dim'],
-        dropout=config.get('dropout', 0.3),
-        cnn_dropout=config.get('cnn_dropout', 0.2),
+        dropout=config.get('dropout', 0.5),
+        cnn_dropout=config.get('cnn_dropout', 0.3),
         use_hidden_layer=config.get('use_hidden_layer', False),
         hidden_dim=config.get('hidden_dim', 64),
-        fusion_mode=config.get('fusion_mode', 'global_attention'),
         fusion_temperature=config.get('fusion_temperature', 2.0)
     ).to(device)
     
@@ -730,7 +742,8 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
     model = wrap_model_multi_gpu(model, n_gpus)
     
     # ====== Loss & Optimizer ======
-    # Use Binary Cross Entropy for binary classification (n_classes=2)
+    # Use Focal Loss for P300 tasks (binary classification with class imbalance)
+    # Use Binary Cross Entropy for other binary classification tasks
     # Use Cross Entropy for multi-class classification (n_classes > 2)
     train_labels = datasets['train'][1]
     if n_classes == 2:
@@ -740,52 +753,75 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
         
         print(f"  Imbalance Ratio: {class_ratio:.2f}:1")
         
-        # Only use pos_weight if imbalance ratio > 1.5
-        if class_ratio > 1.5 or class_ratio < 0.67:
-            pos_weight = torch.tensor([class_ratio], device=device)
-            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-            print(f"Using BCEWithLogitsLoss with pos_weight={class_ratio:.2f} (imbalanced)")
+        # Use Focal Loss for P300 tasks
+        if task in ['P300', 'BNCI2014_P300', 'BI2014b_P300']:
+            # Focal Loss parameters: alpha for class weighting, gamma for focusing
+            # Since we use WeightedRandomSampler, use balanced alpha=0.5 to avoid double reweighting
+            # alpha > 0.5 emphasizes positive class, alpha < 0.5 emphasizes negative class
+            # With sampler, we want balanced focal loss: alpha=0.5, gamma=1.5
+            focal_alpha = config.get('focal_alpha', 0.5)  # Fixed: balanced when using sampler
+            focal_gamma = config.get('focal_gamma', 1.5)  # Slightly lower gamma with sampler
+            criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+            print(f"Using Focal Loss (alpha={focal_alpha}, gamma={focal_gamma}) for P300 task")
+            print(f"  Note: Using balanced alpha=0.5 since WeightedRandomSampler handles class imbalance")
         else:
-            criterion = nn.BCEWithLogitsLoss()
-            print(f"Using BCEWithLogitsLoss without pos_weight (balanced dataset)")
+            # For other binary tasks, use BCE with pos_weight if imbalanced
+            if class_ratio > 1.5 or class_ratio < 0.67:
+                pos_weight = torch.tensor([class_ratio], device=device)
+                criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+                print(f"Using BCEWithLogitsLoss with pos_weight={class_ratio:.2f} (imbalanced)")
+            else:
+                criterion = nn.BCEWithLogitsLoss()
+                print(f"Using BCEWithLogitsLoss without pos_weight (balanced dataset)")
     else:
         criterion = nn.CrossEntropyLoss()
         print(f"Using CrossEntropyLoss for {n_classes}-class classification")
     
     optimizer = torch.optim.Adam(
-        model.parameters(), 
-        lr=config['lr'], 
+        model.parameters(),
+        lr=config['lr'],
         weight_decay=config['weight_decay']
     )
     
     scheduler_type = config.get('scheduler', 'ReduceLROnPlateau')
     if scheduler_type == 'CosineAnnealingLR':
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=config['num_epochs'] // 2, eta_min=1e-6
+            optimizer,
+            T_max=config['num_epochs'] // 2,
+            eta_min=1e-6
         )
     elif scheduler_type == 'ReduceLROnPlateau':
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=5
+            optimizer,
+            mode='min',
+            factor=0.5,
+            patience=5
         )
     else:
         raise ValueError(f"Invalid scheduler: {scheduler_type}")
     
     # ====== Training Loop ======
-    best_val_acc = 0
+    best_score = -1.0
+    best_thr_for_ckpt = 0.5
     patience_counter = 0
     
     if model_path is None:
         seed = config.get('seed', 44)
         model_path = f'best_{task.lower()}_model_{seed}.pth'
     
-    # Check if binary classification
     is_binary = (n_classes == 2)
     
     for epoch in range(config['num_epochs']):
         print(f"\nEpoch [{epoch+1}/{config['num_epochs']}]")
         
         train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, is_binary=is_binary)
-        val_loss, val_acc = evaluate(model, val_loader, device, criterion, is_binary=is_binary)
+        
+        # Evaluate with threshold optimization for binary classification
+        val_loss, val_acc, val_metrics = evaluate(
+            model, val_loader, device, criterion,
+            is_binary=is_binary, return_metrics=True,
+            threshold=0.5, optimize_threshold=is_binary  # Binary: optimize threshold on val
+        )
         
         if scheduler_type == 'CosineAnnealingLR':
             scheduler.step()
@@ -797,18 +833,39 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
         print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
         print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%, LR: {current_lr:.6f}")
         
-        # Save best model (save unwrapped model state for portability)
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        # Print additional metrics for binary classification
+        if is_binary and val_metrics:
+            print(f"Val F1: {val_metrics.get('f1', 0):.2f}%, "
+                  f"Recall: {val_metrics.get('recall', 0):.2f}%, "
+                  f"AUC: {val_metrics.get('auc', 0):.2f}%, "
+                  f"PR-AUC: {val_metrics.get('pr_auc', 0):.2f}%, "
+                  f"Threshold: {val_metrics.get('threshold', 0.5):.3f}")
+        
+        # Save best model: Use PR-AUC for P300 tasks, val_acc for others
+        if is_binary and task in ['P300', 'BNCI2014_P300', 'BI2014b_P300']:
+            # Use PR-AUC (preferred) or AUC as the saving criterion for imbalanced binary tasks
+            score = val_metrics.get("pr_auc", -1)
+            if score is None or score < 0:
+                score = val_metrics.get("auc", -1)
+        else:
+            # Multi-class or other binary tasks: use accuracy
+            score = val_acc
+        
+        if score > best_score:
+            best_score = score
+            best_thr_for_ckpt = val_metrics.get("threshold", 0.5) if is_binary else 0.5
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': unwrap_model(model).state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'best_val_acc': best_val_acc,
+                'best_score': best_score,
+                'best_val_acc': val_acc,
+                'best_threshold': best_thr_for_ckpt,  # Save optimal threshold
                 'task': task,
                 'config': config,
             }, model_path)
-            print(f"✓ Best model saved! ({val_acc:.2f}%)")
+            score_name = "PR-AUC" if (is_binary and task in ['P300', 'BNCI2014_P300', 'BI2014b_P300']) else "Acc"
+            print(f"✓ Best model saved! ({score_name}={best_score:.2f}, thr={best_thr_for_ckpt:.3f})")
             patience_counter = 0
         else:
             patience_counter += 1
@@ -823,92 +880,121 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
     print(f"\n{'='*70}")
     print("Loading best model for final evaluation...")
     print(f"Best model path: {model_path}")
+    
     checkpoint = torch.load(model_path)
-    # Handle DataParallel wrapper when loading
     unwrap_model(model).load_state_dict(checkpoint['model_state_dict'])
     
-    # Evaluate validation set with metrics
-    val_loss, val_acc, val_metrics = evaluate(model, val_loader, device, criterion, is_binary=is_binary, return_metrics=True)
+    # Get best threshold from checkpoint (or re-optimize on val)
+    best_thr = checkpoint.get("best_threshold", 0.5)
+    
+    # Re-optimize threshold on validation set for final evaluation
+    val_loss, val_acc, val_metrics = evaluate(
+        model, val_loader, device, criterion,
+        is_binary=is_binary, return_metrics=True,
+        threshold=best_thr, optimize_threshold=is_binary  # Re-optimize on val
+    )
+    best_thr = val_metrics.get("threshold", best_thr) if is_binary else 0.5
+    
     results = {
-        'val': best_val_acc,
+        'val': checkpoint.get('best_val_acc', val_acc),
         'val_f1': val_metrics.get('f1'),
         'val_recall': val_metrics.get('recall'),
         'val_auc': val_metrics.get('auc'),
+        'val_pr_auc': val_metrics.get('pr_auc') if is_binary else None,
     }
     
     if test1_loader:
-        test1_loss, test1_acc, test1_metrics = evaluate(model, test1_loader, device, criterion, is_binary=is_binary, return_metrics=True)
+        # Test1: Use best threshold from validation (no optimization)
+        test1_loss, test1_acc, test1_metrics = evaluate(
+            model, test1_loader, device, criterion,
+            is_binary=is_binary, return_metrics=True,
+            threshold=best_thr, optimize_threshold=False
+        )
         results['test1'] = test1_acc
         results['test1_loss'] = test1_loss
         results['test1_f1'] = test1_metrics.get('f1')
         results['test1_recall'] = test1_metrics.get('recall')
         results['test1_auc'] = test1_metrics.get('auc')
+        results['test1_pr_auc'] = test1_metrics.get('pr_auc') if is_binary else None
     
     if test2_loader:
-        test2_loss, test2_acc, test2_metrics = evaluate(model, test2_loader, device, criterion, is_binary=is_binary, return_metrics=True)
+        # Test2: Use best threshold from validation (no optimization)
+        test2_loss, test2_acc, test2_metrics = evaluate(
+            model, test2_loader, device, criterion,
+            is_binary=is_binary, return_metrics=True,
+            threshold=best_thr, optimize_threshold=False
+        )
         results['test2'] = test2_acc
         results['test2_loss'] = test2_loss
         results['test2_f1'] = test2_metrics.get('f1')
         results['test2_recall'] = test2_metrics.get('recall')
         results['test2_auc'] = test2_metrics.get('auc')
+        results['test2_pr_auc'] = test2_metrics.get('pr_auc') if is_binary else None
     
     print(f"\n{'='*70}")
     print(f"FINAL RESULTS - {task}")
     print(f"{'='*70}")
-    print(f"Best Val Acc:    {best_val_acc:.2f}%")
-    if results.get('val_f1') is not None:
-        print(f"Val F1:          {results['val_f1']:.2f}%")
-        print(f"Val Recall:      {results['val_recall']:.2f}%")
-        if results.get('val_auc') is not None:
-            print(f"Val AUC:         {results['val_auc']:.2f}%")
+    if is_binary:
+        print(f"Best Threshold:  {best_thr:.3f}")
+        print(f"Val Acc:         {val_acc:.2f}%")
+        if results.get('val_f1') is not None:
+            print(f"Val F1:          {results['val_f1']:.2f}%")
+            print(f"Val Recall:      {results['val_recall']:.2f}%")
+            print(f"Val Precision:   {val_metrics.get('precision', 0):.2f}%")
+            if results.get('val_auc') is not None:
+                print(f"Val AUC:         {results['val_auc']:.2f}%")
+            if results.get('val_pr_auc') is not None:
+                print(f"Val PR-AUC:      {results['val_pr_auc']:.2f}%")
+    else:
+        print(f"Best Val Acc:    {checkpoint.get('best_val_acc', val_acc):.2f}%")
+        if results.get('val_f1') is not None:
+            print(f"Val F1:          {results['val_f1']:.2f}%")
+            print(f"Val Recall:      {results['val_recall']:.2f}%")
+            if results.get('val_auc') is not None and results['val_auc'] > 0:
+                print(f"Val AUC:         {results['val_auc']:.2f}%")
     if 'test1' in results:
-        print(f"Test1 (Seen):    {results['test1']:.2f}% (loss {results['test1_loss']:.4f})")
+        print(f"\nTest1 (Seen):    {results['test1']:.2f}% (loss {results['test1_loss']:.4f})")
         if results.get('test1_f1') is not None:
             print(f"  Test1 F1:      {results['test1_f1']:.2f}%")
             print(f"  Test1 Recall:  {results['test1_recall']:.2f}%")
             if results.get('test1_auc') is not None:
                 print(f"  Test1 AUC:     {results['test1_auc']:.2f}%")
+            if results.get('test1_pr_auc') is not None:
+                print(f"  Test1 PR-AUC:  {results['test1_pr_auc']:.2f}%")
     if 'test2' in results:
-        print(f"Test2 (Unseen):  {results['test2']:.2f}% (loss {results['test2_loss']:.4f})")
+        print(f"\nTest2 (Unseen):  {results['test2']:.2f}% (loss {results['test2_loss']:.4f})")
         if results.get('test2_f1') is not None:
             print(f"  Test2 F1:      {results['test2_f1']:.2f}%")
             print(f"  Test2 Recall:  {results['test2_recall']:.2f}%")
             if results.get('test2_auc') is not None:
                 print(f"  Test2 AUC:     {results['test2_auc']:.2f}%")
+            if results.get('test2_pr_auc') is not None:
+                print(f"  Test2 PR-AUC:  {results['test2_pr_auc']:.2f}%")
     print(f"{'='*70}")
-
-    # ====== COLLECT AND SAVE ATTENTION WEIGHTS ======
+    
+    # ====== Collect and Save Attention Weights ======
     print(f"\n{'='*70}")
     print(f"Collecting attention weights for {task}...")
     
-    # Use the Test 2 (Unseen) loader if available, otherwise use Val loader
     weights_loader = test2_loader if test2_loader else val_loader
     weights_type = 'unseen' if test2_loader else 'val'
     
     if weights_loader:
-        # Note: You must ensure the model is on device and unwrapped for this call,
-        # or handle DataParallel inside the collect_weights if necessary.
-        # Since 'model' is already loaded and on the device, we proceed:
-        
         all_weights_array = collect_weights(model, weights_loader, device)
         
         if all_weights_array is not None and len(all_weights_array) > 0:
             # Ensure 2D shape (N, 2)
             if all_weights_array.ndim == 3:
-                # If somehow still 3D, average over middle dimension
                 all_weights_array = all_weights_array.mean(axis=1)
             
             # Convert to DataFrame and save
             weights_df = pd.DataFrame(
-                all_weights_array, 
+                all_weights_array,
                 columns=['Spectral_Weight', 'Temporal_Weight']
             )
             
-            # Generate filename based on model_path if available, otherwise use default
+            # Generate filename
             if model_path:
-                # Extract config name from model path if it follows the pattern
-                # e.g., "ssvep_stft_nperseg128_overlap50pct_nfft512_model.pth" -> "nperseg128_overlap50pct_nfft512"
-                import os
                 base_name = os.path.basename(model_path)
                 if '_stft_' in base_name and '_model.pth' in base_name:
                     config_part = base_name.split('_stft_')[1].replace('_model.pth', '')
@@ -920,16 +1006,15 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
             
             weights_df.to_csv(csv_filename, index=False)
             
-            # Calculate and print mean for sanity check
+            # Print statistics
             mean_spec = weights_df['Spectral_Weight'].mean()
             mean_time = weights_df['Temporal_Weight'].mean()
-            
             print(f"✓ Attention weights (N={len(weights_df)}) saved to: {csv_filename}")
             print(f"  Mean Spectral Weight: {mean_spec:.4f}")
             print(f"  Mean Temporal Weight: {mean_time:.4f}")
         else:
-            print(f"⚠ No attention weights collected (fusion mode may not support weights)")
-
+            print(f"⚠ No attention weights collected")
+    
     print(f"{'='*70}")
     
     return model, results
@@ -942,7 +1027,7 @@ def train_all_tasks(tasks: Optional[list] = None, save_dir: str = './checkpoints
     Args:
         tasks: List of task names (default: all tasks)
         save_dir: Directory to save model checkpoints
-        
+    
     Returns:
         Dictionary of results for each task
     """
@@ -950,7 +1035,6 @@ def train_all_tasks(tasks: Optional[list] = None, save_dir: str = './checkpoints
         tasks = ['SSVEP', 'P300', 'MI', 'Imagined_speech', 'Lee2019_MI', 'Lee2019_SSVEP', 'BNCI2014_P300', 'BI2014b_P300']
     
     os.makedirs(save_dir, exist_ok=True)
-    
     all_results = {}
     
     print("=" * 80)
@@ -963,7 +1047,6 @@ def train_all_tasks(tasks: Optional[list] = None, save_dir: str = './checkpoints
         print(f"{'='*60}")
         
         try:
-            # Use default seed 44 for train_all_tasks
             model_path = os.path.join(save_dir, f'best_{task.lower()}_model_44.pth')
             model, results = train_task(task, model_path=model_path)
             all_results[task] = results
@@ -974,7 +1057,7 @@ def train_all_tasks(tasks: Optional[list] = None, save_dir: str = './checkpoints
                 print(f"  Test1 Acc: {results['test1']:.2f}%")
             if 'test2' in results:
                 print(f"  Test2 Acc: {results['test2']:.2f}%")
-                
+        
         except Exception as e:
             print(f"Error training {task}: {e}")
             import traceback
@@ -993,9 +1076,9 @@ def train_all_tasks(tasks: Optional[list] = None, save_dir: str = './checkpoints
             print(f"\n{task}:")
             print(f"  Best Val Acc: {results['val']:.2f}%")
             if 'test1' in results:
-                print(f"  Test1 Acc:    {results['test1']:.2f}%")
+                print(f"  Test1 Acc: {results['test1']:.2f}%")
             if 'test2' in results:
-                print(f"  Test2 Acc:    {results['test2']:.2f}%")
+                print(f"  Test2 Acc: {results['test2']:.2f}%")
     
     print(f"\n{'='*80}")
     print("MULTI-TASK TRAINING COMPLETED!")
@@ -1015,60 +1098,54 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description='Train AdaptiveSCALENet on EEG tasks')
     parser.add_argument('--task', type=str, default='SSVEP',
-                        choices=['SSVEP', 'P300', 'MI', 'Imagined_speech', 'Lee2019_MI', 'Lee2019_SSVEP', 'BNCI2014_P300', 'BI2014b_P300', 'all'],
-                        help='Task to train on (default: SSVEP)')
+                       choices=['SSVEP', 'P300', 'MI', 'Imagined_speech', 'Lee2019_MI', 'Lee2019_SSVEP', 'BNCI2014_P300', 'BI2014b_P300', 'all'],
+                       help='Task to train on (default: SSVEP)')
     parser.add_argument('--save_dir', type=str, default='./checkpoints',
-                        help='Directory to save model checkpoints')
+                       help='Directory to save model checkpoints')
     parser.add_argument('--epochs', type=int, default=100,
-                        help='Number of training epochs')
+                       help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=64,
-                        help='Batch size')
+                       help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-3,
-                        help='Learning rate')
+                       help='Learning rate')
     parser.add_argument('--seed', type=int, default=44,
-                        help='Random seed for reproducibility')
-    parser.add_argument('--fusion_mode', type=str, default='global_attention',
-                        choices=['static', 'global_attention', 'spatial_attention', 'glu', 'multiplicative', 'bilinear', 'legacy', 'original'],
-                        help='Fusion strategy: static, global_attention, spatial_attention, glu, multiplicative, bilinear, legacy (default: global_attention)')
+                       help='Random seed for reproducibility')
     parser.add_argument('--fusion_temperature', type=float, default=2.0,
-                        help='Temperature for attention-based fusion strategies (default: 2.0)')
+                       help='Temperature for attention fusion (default: 2.0)')
+    
     # STFT parameters (optional - uses task defaults if not specified)
     parser.add_argument('--stft_fs', type=int, default=None,
-                        help='STFT sampling frequency (Hz). If not specified, uses task default.')
+                       help='STFT sampling frequency (Hz). If not specified, uses task default.')
     parser.add_argument('--stft_nperseg', type=int, default=None,
-                        help='STFT window length (nperseg). If not specified, uses task default.')
+                       help='STFT window length (nperseg). If not specified, uses task default.')
     parser.add_argument('--stft_noverlap', type=int, default=None,
-                        help='STFT overlap length (noverlap). If not specified, uses task default.')
+                       help='STFT overlap length (noverlap). If not specified, uses task default.')
     parser.add_argument('--stft_nfft', type=int, default=None,
-                        help='STFT FFT length (nfft). If not specified, uses task default.')
+                       help='STFT FFT length (nfft). If not specified, uses task default.')
     parser.add_argument('--no_augment', action='store_true',
-                        help='Disable train-time augmentation (default: augmentation ON).')
+                       help='Disable train-time augmentation (default: augmentation ON).')
     
     args = parser.parse_args()
     
-    # Config with task-specific STFT defaults (will be filled in train_task)
+    # Build config
     config = {
         'num_epochs': args.epochs,
         'batch_size': args.batch_size,
         'lr': args.lr,
-        # STFT params will use task-specific defaults from TASK_CONFIGS if not provided
         'cnn_filters': 16,
         'lstm_hidden': 128,
         'pos_dim': 16,
-        'dropout': 0.3,
-        'cnn_dropout': 0.2,
+        'dropout': 0.5,
+        'cnn_dropout': 0.3,
         'use_hidden_layer': True,
         'hidden_dim': 64,
         'weight_decay': 1e-4,
         'patience': 15,
         'scheduler': 'ReduceLROnPlateau',
         'seed': args.seed,
-        'fusion_mode': args.fusion_mode,
         'fusion_temperature': args.fusion_temperature,
+        'augment_train': (not args.no_augment)
     }
-
-    # Train-time augmentation toggle
-    config['augment_train'] = (not args.no_augment)
     
     # Add STFT config if provided (None values will use task defaults)
     if args.stft_fs is not None:

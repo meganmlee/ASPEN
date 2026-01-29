@@ -24,8 +24,9 @@ from datetime import datetime
 import torch
 import torch.nn.functional as F
 import numpy as np
-from sklearn.metrics import f1_score, recall_score, roc_auc_score
+from sklearn.metrics import f1_score, recall_score, roc_auc_score, average_precision_score, precision_recall_curve, precision_score
 from tqdm import tqdm
+from torch.utils.data import WeightedRandomSampler
 
 # Add scale-net directory to path
 scale_net_path = os.path.join(os.path.dirname(__file__), '..', '..', 'scale-net')
@@ -38,7 +39,57 @@ from dataset import TASK_CONFIGS, load_dataset, create_dataloaders
 
 # ==================== Evaluation with Metrics ====================
 
-def evaluate_with_metrics(model, loader, device, is_binary=False):
+def find_best_threshold(y_true, y_prob, mode="f1"):
+    """
+    Find optimal threshold for binary classification
+    
+    Args:
+        y_true: True labels (numpy array)
+        y_prob: Predicted probabilities (numpy array)
+        mode: Optimization mode
+            - "f1": F1 score maximization
+            - "youden": TPR-FPR maximization (Youden's J statistic)
+            - "recall_at_precision": Maximize recall with precision >= 0.5
+    
+    Returns:
+        best_threshold, best_score
+    """
+    y_true = np.asarray(y_true).astype(int)
+    y_prob = np.asarray(y_prob).astype(float)
+
+    thresholds = np.linspace(0.01, 0.99, 99)
+    best_t, best_score = 0.5, -1.0
+
+    for t in thresholds:
+        y_pred = (y_prob >= t).astype(int)
+        if mode == "f1":
+            score = f1_score(y_true, y_pred, average="binary", zero_division=0)
+        elif mode == "youden":
+            # TPR - FPR = Recall - (1 - Specificity)
+            tn = np.sum((y_pred == 0) & (y_true == 0))
+            fp = np.sum((y_pred == 1) & (y_true == 0))
+            tp = np.sum((y_pred == 1) & (y_true == 1))
+            fn = np.sum((y_pred == 0) & (y_true == 1))
+            tpr = tp / (tp + fn) if (tp + fn) > 0 else 0
+            fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
+            score = tpr - fpr
+        elif mode == "recall_at_precision":
+            prec = precision_score(y_true, y_pred, average="binary", zero_division=0)
+            if prec >= 0.5:
+                score = recall_score(y_true, y_pred, average="binary", zero_division=0)
+            else:
+                score = -1
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+        
+        if score > best_score:
+            best_score = score
+            best_t = t
+
+    return float(best_t), float(best_score)
+
+
+def evaluate_with_metrics(model, loader, device, is_binary=False, threshold=0.5, optimize_threshold=False):
     """
     Evaluate model and calculate f1, recall, auc metrics
     
@@ -47,9 +98,11 @@ def evaluate_with_metrics(model, loader, device, is_binary=False):
         loader: DataLoader for evaluation
         device: Device to run on
         is_binary: Whether this is binary classification
+        threshold: Threshold for binary classification (default: 0.5)
+        optimize_threshold: If True, find optimal threshold (only for binary)
         
     Returns:
-        Dictionary with 'acc', 'f1', 'recall', 'auc' (if applicable)
+        Dictionary with 'acc', 'f1', 'recall', 'auc', 'pr_auc', 'threshold' (if applicable)
     """
     model.eval()
     all_preds = []
@@ -74,22 +127,31 @@ def evaluate_with_metrics(model, loader, device, is_binary=False):
             # Get predictions and probabilities
             if is_binary:
                 probs = torch.sigmoid(outputs).squeeze(1) if outputs.dim() > 1 else torch.sigmoid(outputs)
-                pred = (probs > 0.5).long()
+                all_probs.append(probs.detach().cpu().numpy())
+                # Use threshold for prediction (will be re-computed if optimize_threshold=True)
+                pred = (probs >= threshold).long()
             else:
                 probs = F.softmax(outputs, dim=1)
                 _, pred = outputs.max(1)
+                all_probs.append(probs.detach().cpu().numpy())
             
-            all_preds.append(pred.cpu().numpy())
-            all_labels.append(labels.cpu().numpy())
-            all_probs.append(probs.cpu().numpy())
+            all_preds.append(pred.detach().cpu().numpy())
+            all_labels.append(labels.detach().cpu().numpy())
             
             total += labels.size(0)
             correct += pred.eq(labels).sum().item()
     
-    # Concatenate all predictions
+    # Concatenate all predictions and probabilities
     all_preds = np.concatenate(all_preds)
     all_labels = np.concatenate(all_labels)
     all_probs = np.concatenate(all_probs)
+    
+    # Optimize threshold for binary classification if requested
+    best_thr = threshold
+    if is_binary and optimize_threshold:
+        best_thr, best_f1 = find_best_threshold(all_labels, all_probs, mode="f1")
+        # Recompute predictions with optimal threshold
+        all_preds = (all_probs >= best_thr).astype(int)
     
     # Calculate accuracy
     acc = 100.0 * correct / total
@@ -98,29 +160,27 @@ def evaluate_with_metrics(model, loader, device, is_binary=False):
     
     # Calculate F1 score
     if is_binary:
-        f1 = f1_score(all_labels, all_preds, average='binary', zero_division=0)
+        metrics['threshold'] = best_thr
+        metrics['f1'] = f1_score(all_labels, all_preds, average='binary', zero_division=0) * 100
+        metrics['recall'] = recall_score(all_labels, all_preds, average='binary', zero_division=0) * 100
+        metrics['precision'] = precision_score(all_labels, all_preds, average='binary', zero_division=0) * 100
     else:
-        f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
-    metrics['f1'] = f1 * 100
-    
-    # Calculate Recall
-    if is_binary:
-        recall = recall_score(all_labels, all_preds, average='binary', zero_division=0)
-    else:
-        recall = recall_score(all_labels, all_preds, average='macro', zero_division=0)
-    metrics['recall'] = recall * 100
+        metrics['f1'] = f1_score(all_labels, all_preds, average='macro', zero_division=0) * 100
+        metrics['recall'] = recall_score(all_labels, all_preds, average='macro', zero_division=0) * 100
     
     # Calculate AUC
     try:
         if is_binary:
-            auc = roc_auc_score(all_labels, all_probs)
+            metrics['auc'] = roc_auc_score(all_labels, all_probs) * 100
+            metrics['pr_auc'] = average_precision_score(all_labels, all_probs) * 100
         else:
             # Multi-class: use one-vs-rest
-            auc = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='macro')
-        metrics['auc'] = auc * 100
+            metrics['auc'] = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='macro') * 100
+            metrics['pr_auc'] = None
     except Exception as e:
         # If AUC calculation fails (e.g., only one class present), set to None
         metrics['auc'] = None
+        metrics['pr_auc'] = None
     
     return metrics
 
@@ -145,7 +205,7 @@ def get_stft_param_settings(task: str) -> List[Dict]:
         'SSVEP': 250,  # 250 Hz: 250 samples = 1 sec
         'Lee2019_SSVEP': 1000,  # 1000 Hz: 1000 samples = 1 sec
         'P300': 256,  # 256 Hz: 256 samples = 1 sec
-        'BNCI2014_P300': 512,  # 256 Hz: but code resamples to 512 samples
+        'BNCI2014_P300': 256,  # 256 Hz: Fixed - no resampling, use original 256 samples
         'BI2014b_P300': 512,  # 512 Hz: 512 samples = 1 sec
         'MI': 1000,  # 250 Hz: 1000 samples = 4 sec
         'Lee2019_MI': 1000,  # 1000 Hz: 1000 samples = 1 sec
@@ -273,18 +333,26 @@ def get_stft_param_settings(task: str) -> List[Dict]:
     for nperseg in nperseg_values:
         for overlap_ratio in overlap_values:
             noverlap = int(nperseg * overlap_ratio)
+            # CRITICAL: Ensure noverlap < nperseg (strict inequality required by scipy)
             if noverlap >= nperseg:
-                continue  # Skip invalid
+                # Adjust to maximum valid value
+                noverlap = max(1, nperseg - 1)
+                # Recalculate actual overlap ratio
+                actual_overlap_ratio = noverlap / nperseg
+                print(f"WARNING: Generated noverlap ({int(nperseg * overlap_ratio)}) >= nperseg ({nperseg})")
+                print(f"  Adjusting to noverlap={noverlap}, actual overlap={actual_overlap_ratio*100:.1f}%")
+            else:
+                actual_overlap_ratio = overlap_ratio
             
             for nfft in nfft_values:
                 if nfft < nperseg:
-                    continue  # Skip invalid
+                    continue  # Skip invalid (nfft must be >= nperseg)
                 
                 selected.append({
                     'nperseg': nperseg,
-                    'noverlap': noverlap,
+                    'noverlap': noverlap,  # Use validated noverlap
                     'nfft': nfft,
-                    'overlap_ratio': overlap_ratio,
+                    'overlap_ratio': actual_overlap_ratio,  # Use actual overlap ratio
                 })
     
     # Add names to configurations
@@ -346,8 +414,12 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
     print(f"{'='*80}")
     
     results = []
-    best_acc = 0.0
+    best_acc = -1.0  # Changed to -1.0 to handle PR-AUC which can be 0-100
     best_config = None
+    
+    # Determine if this is a P300 task for best config selection
+    n_classes = task_config.get('num_classes', 26)
+    is_binary_p300 = (n_classes == 2) and (task in ['P300', 'BNCI2014_P300', 'BI2014b_P300'])
     
     for idx, stft_params in enumerate(param_settings, 1):
         nperseg = stft_params['nperseg']
@@ -356,33 +428,42 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
         name = stft_params['name']
         overlap_ratio = stft_params['overlap_ratio']
         
-        # Validate parameters
+        # Validate parameters BEFORE using them
+        # Fix noverlap if it's >= nperseg (should not happen, but safety check)
+        original_noverlap = noverlap
         if noverlap >= nperseg:
             noverlap = max(1, nperseg - 1)
+            print(f"WARNING: noverlap ({original_noverlap}) >= nperseg ({nperseg}), adjusting to {noverlap}")
         
+        # Fix nfft if it's < nperseg
+        original_nfft = nfft
         if nfft < nperseg:
             nfft = 2 ** (nperseg.bit_length() - 1)
             if nfft < nperseg:
                 nfft = 2 ** nperseg.bit_length()
+            print(f"WARNING: nfft ({original_nfft}) < nperseg ({nperseg}), adjusting to {nfft}")
+        
+        # Recalculate overlap_ratio based on corrected noverlap
+        corrected_overlap_ratio = noverlap / nperseg if nperseg > 0 else 0.5
         
         print(f"\n{'-'*80}")
         print(f"Configuration {idx}/{len(param_settings)}: {name}")
         print(f"  nperseg: {nperseg} ({nperseg/sampling_rate:.3f} sec)")
-        print(f"  noverlap: {noverlap} ({overlap_ratio*100:.1f}% overlap)")
-        print(f"  nfft: {nfft}")
+        print(f"  noverlap: {noverlap} (original: {original_noverlap}, overlap: {corrected_overlap_ratio*100:.1f}%)")
+        print(f"  nfft: {nfft} (original: {original_nfft})")
         print(f"  Frequency resolution: {sampling_rate/nfft:.2f} Hz/bin")
         print(f"  Time resolution: {(nperseg-noverlap)/sampling_rate:.3f} sec/step")
         print(f"{'-'*80}")
         
-        # Create config for training
+        # Create config for training (use VALIDATED parameters)
         config = {
             'seed': seed,
             'batch_size': batch_size,
             'num_epochs': epochs,
             'stft_fs': sampling_rate,
             'stft_nperseg': nperseg,
-            'stft_noverlap': noverlap,
-            'stft_nfft': nfft,
+            'stft_noverlap': noverlap,  # Use validated noverlap
+            'stft_nfft': nfft,  # Use validated nfft
             # Model parameters
             'cnn_filters': 16,
             'lstm_hidden': 128,
@@ -421,12 +502,30 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
                 seed=seed
             )
             
+            # Get n_classes for sampler creation
+            n_classes = task_config.get('num_classes', 26)
+            is_binary = (n_classes == 2)
+            
+            # Use VALIDATED parameters for stft_config (same as config above)
             stft_config = {
                 'fs': sampling_rate,
                 'nperseg': nperseg,
-                'noverlap': noverlap,
-                'nfft': nfft
+                'noverlap': noverlap,  # Use validated noverlap, not original from stft_params
+                'nfft': nfft  # Use validated nfft, not original from stft_params
             }
+            
+            # For P300 tasks, use WeightedRandomSampler for balanced batches
+            train_sampler = None
+            if task in ['P300', 'BNCI2014_P300', 'BI2014b_P300'] and is_binary:
+                train_labels = datasets['train'][1]
+                class_counts = np.bincount(train_labels)
+                class_weights = 1.0 / class_counts
+                sample_weights = class_weights[train_labels]
+                train_sampler = WeightedRandomSampler(
+                    weights=sample_weights,
+                    num_samples=len(train_labels),
+                    replacement=True
+                )
             
             loaders = create_dataloaders(
                 datasets,
@@ -434,7 +533,8 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
                 batch_size=batch_size,
                 num_workers=0,  # Use 0 to avoid multiprocessing issues
                 augment_train=False,
-                seed=seed
+                seed=seed,
+                train_sampler=train_sampler
             )
             
             # Get model dimensions
@@ -447,9 +547,6 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
             # Reload best model
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             checkpoint = torch.load(model_path, map_location=device)
-            
-            n_classes = task_config.get('num_classes', 26)
-            is_binary = (n_classes == 2)
             
             # Create model and load weights
             eval_model = SCALENet(
@@ -469,16 +566,38 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
             eval_model.load_state_dict(checkpoint['model_state_dict'])
             eval_model.eval()
             
-            # Calculate metrics for each split
-            val_metrics = evaluate_with_metrics(eval_model, loaders['val'], device, is_binary=is_binary)
+            # Get best threshold from checkpoint (or use 0.5)
+            best_thr = checkpoint.get("best_threshold", 0.5)
+            
+            # Calculate metrics for each split with threshold optimization on val
+            val_metrics = evaluate_with_metrics(
+                eval_model, loaders['val'], device, 
+                is_binary=is_binary, 
+                threshold=best_thr, 
+                optimize_threshold=is_binary  # Re-optimize on val
+            )
+            best_thr = val_metrics.get("threshold", best_thr) if is_binary else 0.5
+            
             test1_metrics = None
             test2_metrics = None
             
             if 'test1' in loaders:
-                test1_metrics = evaluate_with_metrics(eval_model, loaders['test1'], device, is_binary=is_binary)
+                # Test1: Use best threshold from validation (no optimization)
+                test1_metrics = evaluate_with_metrics(
+                    eval_model, loaders['test1'], device, 
+                    is_binary=is_binary,
+                    threshold=best_thr,
+                    optimize_threshold=False
+                )
             
             if 'test2' in loaders:
-                test2_metrics = evaluate_with_metrics(eval_model, loaders['test2'], device, is_binary=is_binary)
+                # Test2: Use best threshold from validation (no optimization)
+                test2_metrics = evaluate_with_metrics(
+                    eval_model, loaders['test2'], device, 
+                    is_binary=is_binary,
+                    threshold=best_thr,
+                    optimize_threshold=False
+                )
             
             # Extract results
             result = {
@@ -495,24 +614,35 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
                 'val_f1': val_metrics.get('f1'),
                 'val_recall': val_metrics.get('recall'),
                 'val_auc': val_metrics.get('auc'),
+                'val_pr_auc': val_metrics.get('pr_auc'),
+                'val_threshold': val_metrics.get('threshold') if is_binary else None,
                 'test1_acc': test1_metrics['acc'] if test1_metrics else None,
                 'test1_f1': test1_metrics.get('f1') if test1_metrics else None,
                 'test1_recall': test1_metrics.get('recall') if test1_metrics else None,
                 'test1_auc': test1_metrics.get('auc') if test1_metrics else None,
+                'test1_pr_auc': test1_metrics.get('pr_auc') if test1_metrics else None,
                 'test1_loss': train_results.get('test1_loss', None),
                 'test2_acc': test2_metrics['acc'] if test2_metrics else None,
                 'test2_f1': test2_metrics.get('f1') if test2_metrics else None,
                 'test2_recall': test2_metrics.get('recall') if test2_metrics else None,
                 'test2_auc': test2_metrics.get('auc') if test2_metrics else None,
+                'test2_pr_auc': test2_metrics.get('pr_auc') if test2_metrics else None,
                 'test2_loss': train_results.get('test2_loss', None),
             }
             
             results.append(result)
             
-            # Track best configuration
-            current_acc = result['val_acc']
-            if current_acc > best_acc:
-                best_acc = current_acc
+            # Track best configuration: Use PR-AUC for P300 tasks, val_acc for others
+            if is_binary and task in ['P300', 'BNCI2014_P300', 'BI2014b_P300']:
+                # Use PR-AUC (preferred) or AUC as the selection criterion
+                current_score = result.get('val_pr_auc', -1)
+                if current_score is None or current_score < 0:
+                    current_score = result.get('val_auc', -1)
+            else:
+                current_score = result['val_acc']
+            
+            if current_score > best_acc:
+                best_acc = current_score
                 best_config = result.copy()
             
             if verbose:
@@ -521,17 +651,21 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
                 if result.get('val_f1') is not None:
                     print(f"  Val F1: {result['val_f1']:.2f}%, Recall: {result['val_recall']:.2f}%", end="")
                     if result.get('val_auc') is not None:
-                        print(f", AUC: {result['val_auc']:.2f}%")
-                    else:
-                        print()
+                        print(f", AUC: {result['val_auc']:.2f}%", end="")
+                    if result.get('val_pr_auc') is not None:
+                        print(f", PR-AUC: {result['val_pr_auc']:.2f}%", end="")
+                    if result.get('val_threshold') is not None:
+                        print(f", Threshold: {result['val_threshold']:.3f}", end="")
+                    print()
                 if result['test1_acc']:
                     print(f"  Test1 Acc: {result['test1_acc']:.2f}%", end="")
                     if result.get('test1_f1') is not None:
                         print(f" (F1: {result['test1_f1']:.2f}%, Recall: {result['test1_recall']:.2f}%", end="")
                         if result.get('test1_auc') is not None:
-                            print(f", AUC: {result['test1_auc']:.2f}%)")
-                        else:
-                            print(")")
+                            print(f", AUC: {result['test1_auc']:.2f}%", end="")
+                        if result.get('test1_pr_auc') is not None:
+                            print(f", PR-AUC: {result['test1_pr_auc']:.2f}%", end="")
+                        print(")")
                     else:
                         print()
                 if result['test2_acc']:
@@ -539,9 +673,10 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
                     if result.get('test2_f1') is not None:
                         print(f" (F1: {result['test2_f1']:.2f}%, Recall: {result['test2_recall']:.2f}%", end="")
                         if result.get('test2_auc') is not None:
-                            print(f", AUC: {result['test2_auc']:.2f}%)")
-                        else:
-                            print(")")
+                            print(f", AUC: {result['test2_auc']:.2f}%", end="")
+                        if result.get('test2_pr_auc') is not None:
+                            print(f", PR-AUC: {result['test2_pr_auc']:.2f}%", end="")
+                        print(")")
                     else:
                         print()
         
@@ -564,10 +699,19 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
     results_df.to_csv(results_file, index=False)
     print(f"\n✓ Results saved to: {results_file}")
     
-    # Sort by validation accuracy
+    # Sort by validation accuracy or PR-AUC (for P300 tasks)
     successful_results = [r for r in results if 'error' not in r]
     if successful_results:
-        successful_results.sort(key=lambda x: x['val_acc'], reverse=True)
+        if is_binary_p300:
+            # For P300 tasks, sort by PR-AUC (preferred) or AUC
+            def get_score(x):
+                score = x.get('val_pr_auc', -1)
+                if score is None or score < 0:
+                    score = x.get('val_auc', -1)
+                return score if score is not None else -1
+            successful_results.sort(key=get_score, reverse=True)
+        else:
+            successful_results.sort(key=lambda x: x['val_acc'], reverse=True)
         
         # Save top 10 configurations
         top10_file = os.path.join(save_dir, f'{task.lower()}_stft_27_top10.csv')
@@ -601,10 +745,15 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
             print(f"  nperseg: {result['nperseg']}, noverlap: {result['noverlap']}, nfft: {result['nfft']}")
             print(f"  Overlap: {result['overlap_ratio']*100:.1f}%, Time step: {result['time_step_sec']:.3f}s")
             print(f"  Val Acc: {result['val_acc']:.2f}%", end="")
-        if result.get('val_f1') is not None:
-            print(f" | F1: {result['val_f1']:.2f}%, Recall: {result['val_recall']:.2f}%", end="")
-            if result.get('val_auc') is not None:
-                print(f", AUC: {result['val_auc']:.2f}%")
+            if result.get('val_f1') is not None:
+                print(f" | F1: {result['val_f1']:.2f}%, Recall: {result['val_recall']:.2f}%", end="")
+                if result.get('val_auc') is not None:
+                    print(f", AUC: {result['val_auc']:.2f}%", end="")
+                if result.get('val_pr_auc') is not None:
+                    print(f", PR-AUC: {result['val_pr_auc']:.2f}%", end="")
+                if result.get('val_threshold') is not None:
+                    print(f", Threshold: {result['val_threshold']:.3f}", end="")
+                print()
             else:
                 print()
         else:
@@ -703,39 +852,43 @@ def run_all_tasks_ablation(tasks: Optional[List[str]] = None,
     for task, result in all_results.items():
         if 'error' not in result and 'best_config' in result:
             best = result['best_config']
-        print(f"\n{task}:")
-        print(f"  Config: {best['config_name']}")
-        print(f"  Params: nperseg={best['nperseg']}, noverlap={best['noverlap']}, nfft={best['nfft']}")
-        print(f"  Val Acc: {best['val_acc']:.2f}%", end="")
-        if best.get('val_f1') is not None:
-            print(f" | F1: {best['val_f1']:.2f}%, Recall: {best['val_recall']:.2f}%", end="")
-            if best.get('val_auc') is not None:
-                print(f", AUC: {best['val_auc']:.2f}%")
+            print(f"\n{task}:")
+            print(f"  Config: {best['config_name']}")
+            print(f"  Params: nperseg={best['nperseg']}, noverlap={best['noverlap']}, nfft={best['nfft']}")
+            print(f"  Val Acc: {best['val_acc']:.2f}%", end="")
+            if best.get('val_f1') is not None:
+                print(f" | F1: {best['val_f1']:.2f}%, Recall: {best['val_recall']:.2f}%", end="")
+                if best.get('val_auc') is not None:
+                    print(f", AUC: {best['val_auc']:.2f}%", end="")
+                if best.get('val_pr_auc') is not None:
+                    print(f", PR-AUC: {best['val_pr_auc']:.2f}%", end="")
+                if best.get('val_threshold') is not None:
+                    print(f", Threshold: {best['val_threshold']:.3f}", end="")
+                print()
             else:
                 print()
-        else:
-            print()
-        if best.get('test1_acc'):
-            print(f"  Test1 Acc: {best['test1_acc']:.2f}%", end="")
-            if best.get('test1_f1') is not None:
-                print(f" | F1: {best['test1_f1']:.2f}%, Recall: {best['test1_recall']:.2f}%", end="")
-                if best.get('test1_auc') is not None:
-                    print(f", AUC: {best['test1_auc']:.2f}%")
+            if best.get('test1_acc'):
+                print(f"  Test1 Acc: {best['test1_acc']:.2f}%", end="")
+                if best.get('test1_f1') is not None:
+                    print(f" | F1: {best['test1_f1']:.2f}%, Recall: {best['test1_recall']:.2f}%", end="")
+                    if best.get('test1_auc') is not None:
+                        print(f", AUC: {best['test1_auc']:.2f}%", end="")
+                    if best.get('test1_pr_auc') is not None:
+                        print(f", PR-AUC: {best['test1_pr_auc']:.2f}%", end="")
+                    print()
                 else:
                     print()
-            else:
-                print()
-        if best.get('test2_acc'):
-            print(f"  Test2 Acc: {best['test2_acc']:.2f}%", end="")
-            if best.get('test2_f1') is not None:
-                print(f" | F1: {best['test2_f1']:.2f}%, Recall: {best['test2_recall']:.2f}%", end="")
-                if best.get('test2_auc') is not None:
-                    print(f", AUC: {best['test2_auc']:.2f}%")
+            if best.get('test2_acc'):
+                print(f"  Test2 Acc: {best['test2_acc']:.2f}%", end="")
+                if best.get('test2_f1') is not None:
+                    print(f" | F1: {best['test2_f1']:.2f}%, Recall: {best['test2_recall']:.2f}%", end="")
+                    if best.get('test2_auc') is not None:
+                        print(f", AUC: {best['test2_auc']:.2f}%", end="")
+                    if best.get('test2_pr_auc') is not None:
+                        print(f", PR-AUC: {best['test2_pr_auc']:.2f}%", end="")
+                    print()
                 else:
                     print()
-            else:
-                print()
-        else:
             print(f"\n{task}: FAILED")
     print(f"{'='*80}")
     

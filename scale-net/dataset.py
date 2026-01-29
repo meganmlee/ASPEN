@@ -62,7 +62,7 @@ TASK_CONFIGS = {
         "num_subjects": 10,
         "num_seen": 7,
         "data_dir": "/ocean/projects/cis250213p/shared/bnci2014_p300",
-        "sampling_rate": 512,
+        "sampling_rate": 256,
         "stft_nperseg": 256,
         "stft_noverlap": 240,
         "stft_nfft": 512,
@@ -72,7 +72,7 @@ TASK_CONFIGS = {
         "num_subjects": 38,
         "num_seen": 30,
         "data_dir": "/ocean/projects/cis250213p/shared/bi2014b_processed",
-        "sampling_rate": 256,
+        "sampling_rate": 512,
         "stft_nperseg": 64,
         "stft_noverlap": 56,
         "stft_nfft": 256,
@@ -594,13 +594,10 @@ def load_bnci_p300(data_dir: str, num_seen: int = 7, seed: int = 44) -> Dict:
                 label = 1 if stim_raw[start] == 1 else 0
                 
                 # Extract 1s window @ 256Hz (256 samples)
+                # No resampling - use original 256 samples with sampling_rate=256
                 end = start + 256 
                 if end <= raw_x.shape[0]:
                     trial = raw_x[start:end, :].T # (16, 256)
-                    
-                    # Resample to 512 samples to match the 512Hz Task Config
-                    # This ensures consistency with your STFT parameters
-                    trial = signal.resample(trial, 512, axis=-1)
                     
                     sub_x.append(trial.astype(np.float32))
                     sub_y.append(label)
@@ -1123,7 +1120,8 @@ def get_stft_dimensions(data_sample: np.ndarray, stft_config: Dict) -> Tuple[int
 
 
 def create_dataloaders(datasets: Dict, stft_config: Dict, batch_size: int = 32, 
-                       num_workers: int = 4, augment_train: bool = True, seed: int = 44) -> Dict:
+                       num_workers: int = 4, augment_train: bool = True, seed: int = 44,
+                       train_sampler=None) -> Dict:
     """
     Create DataLoaders for all splits
     
@@ -1134,6 +1132,7 @@ def create_dataloaders(datasets: Dict, stft_config: Dict, batch_size: int = 32,
         num_workers: Number of workers for DataLoader
         augment_train: Whether to augment training data
         seed: seed for shuffling
+        train_sampler: Optional sampler for training set (if provided, shuffle is ignored for train)
         
     Returns:
         Dictionary of DataLoaders
@@ -1145,18 +1144,31 @@ def create_dataloaders(datasets: Dict, stft_config: Dict, batch_size: int = 32,
     
     for split, (X, y) in datasets.items():
         augment = augment_train if split == 'train' else False
-        shuffle = (split == 'train')
+        shuffle = (split == 'train') and (train_sampler is None)
         
         ds = EEGDataset(X, y, stft_config, normalize=True, augment=augment)
-        loaders[split] = DataLoader(
-            ds, 
-            batch_size=batch_size, 
-            shuffle=shuffle,
-            num_workers=num_workers, 
-            pin_memory=True,
-            worker_init_fn=lambda worker_id: worker_init_fn(worker_id, seed),
-            generator=get_generator(seed) if shuffle else None
-        )
+        
+        # Use sampler for train if provided, otherwise use shuffle
+        if split == 'train' and train_sampler is not None:
+            loaders[split] = DataLoader(
+                ds, 
+                batch_size=batch_size,
+                sampler=train_sampler,
+                num_workers=num_workers, 
+                pin_memory=True,
+                worker_init_fn=lambda worker_id: worker_init_fn(worker_id, seed),
+                generator=get_generator(seed)
+            )
+        else:
+            loaders[split] = DataLoader(
+                ds, 
+                batch_size=batch_size, 
+                shuffle=shuffle,
+                num_workers=num_workers, 
+                pin_memory=True,
+                worker_init_fn=lambda worker_id: worker_init_fn(worker_id, seed),
+                generator=get_generator(seed) if shuffle else None
+            )
     
     return loaders
 

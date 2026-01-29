@@ -6,5 +6,7 @@ __pycache__/
 /ablation/fusion_ablations/ablation_SSVEP/**
 /ablation/stft_params/ablation_results/**
 /scale-net/checkpoints/**
+/baseline/checkpoints/**
 *.csv
-*.pth
+**/*.pth
+**/*.png

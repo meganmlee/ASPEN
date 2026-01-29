@@ -15,6 +15,7 @@ import os
 import random
 import sys
 from typing import Optional, Dict, Tuple
+from sklearn.metrics import f1_score, recall_score, roc_auc_score, average_precision_score, precision_recall_curve, precision_score
 
 # Add scale-net directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scale-net'))
@@ -326,6 +327,56 @@ def unwrap_model(model):
 
 # ==================== Training Functions ====================
 
+def find_best_threshold(y_true, y_prob, mode="f1"):
+    """
+    Find optimal threshold for binary classification
+    
+    Args:
+        y_true: True labels (numpy array)
+        y_prob: Predicted probabilities (numpy array)
+        mode: Optimization mode
+            - "f1": F1 score maximization
+            - "youden": TPR-FPR maximization (Youden's J statistic)
+            - "recall_at_precision": Maximize recall with precision >= 0.5
+    
+    Returns:
+        best_threshold, best_score
+    """
+    y_true = np.asarray(y_true).astype(int)
+    y_prob = np.asarray(y_prob).astype(float)
+
+    thresholds = np.linspace(0.01, 0.99, 99)
+    best_t, best_score = 0.5, -1.0
+
+    for t in thresholds:
+        y_pred = (y_prob >= t).astype(int)
+        if mode == "f1":
+            score = f1_score(y_true, y_pred, average="binary", zero_division=0)
+        elif mode == "youden":
+            # TPR - FPR = Recall - (1 - Specificity)
+            tn = np.sum((y_pred == 0) & (y_true == 0))
+            fp = np.sum((y_pred == 1) & (y_true == 0))
+            tp = np.sum((y_pred == 1) & (y_true == 1))
+            fn = np.sum((y_pred == 0) & (y_true == 1))
+            tpr = tp / (tp + fn) if (tp + fn) > 0 else 0
+            fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
+            score = tpr - fpr
+        elif mode == "recall_at_precision":
+            prec = precision_score(y_true, y_pred, average="binary", zero_division=0)
+            if prec >= 0.5:
+                score = recall_score(y_true, y_pred, average="binary", zero_division=0)
+            else:
+                score = -1
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+        
+        if score > best_score:
+            best_score = score
+            best_t = t
+
+    return float(best_t), float(best_score)
+
+
 def train_epoch(model, loader, criterion, optimizer, device, is_binary=False):
     model.train()
     total_loss, correct, total = 0, 0, 0
@@ -364,9 +415,31 @@ def train_epoch(model, loader, criterion, optimizer, device, is_binary=False):
     return total_loss / len(loader), 100. * correct / total
 
 
-def evaluate(model, loader, device, criterion=None, is_binary=False):
+def evaluate(model, loader, device, criterion=None, is_binary=False, return_metrics=False,
+             threshold=0.5, optimize_threshold=False):
+    """
+    Evaluate model on a dataset
+    
+    Args:
+        model: Model to evaluate
+        loader: DataLoader
+        device: Device to run on
+        criterion: Loss function (optional)
+        is_binary: Whether this is binary classification
+        return_metrics: If True, return additional metrics (f1, recall, auc)
+        threshold: Threshold for binary classification (default: 0.5)
+        optimize_threshold: If True, find optimal threshold on validation set (only for binary)
+    
+    Returns:
+        If return_metrics=False: (avg_loss, acc)
+        If return_metrics=True: (avg_loss, acc, metrics_dict)
+            where metrics_dict contains 'f1', 'recall', 'auc', 'threshold' (if applicable)
+    """
     model.eval()
     total_loss, correct, total = 0.0, 0, 0
+    all_preds = []
+    all_labels = []
+    all_probs = []  # For AUC calculation and threshold optimization
     
     with torch.no_grad():
         for inputs, labels in tqdm(loader, desc='Eval', ncols=100):
@@ -383,18 +456,74 @@ def evaluate(model, loader, device, criterion=None, is_binary=False):
                 loss = criterion(outputs, labels_loss)
                 total_loss += loss.item()
             
-            # Prediction
+            # Prediction: binary uses sigmoid threshold, multi-class uses argmax
             if is_binary:
-                pred = (torch.sigmoid(outputs) > 0.5).squeeze(1).long()
+                probs = torch.sigmoid(outputs).squeeze(1)  # (B,)
+                if return_metrics:
+                    all_probs.append(probs.detach().cpu().numpy())
+                # Use threshold for prediction (will be re-computed if optimize_threshold=True)
+                pred = (probs >= threshold).long()
             else:
-                _, pred = outputs.max(1)
+                probs = F.softmax(outputs, dim=1)  # (B, n_classes)
+                pred = outputs.argmax(1)
+                if return_metrics:
+                    all_probs.append(probs.detach().cpu().numpy())
+            
+            if return_metrics:
+                all_preds.append(pred.detach().cpu().numpy())
+                all_labels.append(labels.detach().cpu().numpy())
             
             total += labels.size(0)
             correct += pred.eq(labels).sum().item()
     
     avg_loss = total_loss / len(loader) if criterion is not None else None
     acc = 100. * correct / total
-    return avg_loss, acc
+    
+    if not return_metrics:
+        return avg_loss, acc
+    
+    # Concatenate all predictions and probabilities
+    all_labels = np.concatenate(all_labels)
+    all_probs = np.concatenate(all_probs)
+    
+    # Optimize threshold for binary classification if requested
+    best_thr = threshold
+    if is_binary and optimize_threshold:
+        best_thr, best_f1 = find_best_threshold(all_labels, all_probs, mode="f1")
+        # Recompute predictions with optimal threshold
+        all_preds = (all_probs >= best_thr).astype(int)
+    else:
+        all_preds = np.concatenate(all_preds)
+    
+    metrics = {}
+    
+    # F1 score (macro average for multi-class, binary for binary)
+    if is_binary:
+        metrics["threshold"] = best_thr
+        metrics["f1"] = f1_score(all_labels, all_preds, average="binary", zero_division=0) * 100
+        metrics["recall"] = recall_score(all_labels, all_preds, average="binary", zero_division=0) * 100
+        metrics["precision"] = precision_score(all_labels, all_preds, average="binary", zero_division=0) * 100
+        metrics["auc"] = roc_auc_score(all_labels, all_probs) * 100
+        metrics["pr_auc"] = average_precision_score(all_labels, all_probs) * 100
+    else:
+        metrics["f1"] = f1_score(all_labels, all_preds, average="macro", zero_division=0) * 100
+        metrics["recall"] = recall_score(all_labels, all_preds, average="macro", zero_division=0) * 100
+        # Multi-class AUC calculation (one-vs-rest)
+        try:
+            if all_probs.ndim == 2 and all_probs.shape[1] > 2:
+                # Multi-class: use macro average of one-vs-rest AUC
+                from sklearn.preprocessing import label_binarize
+                y_bin = label_binarize(all_labels, classes=np.arange(all_probs.shape[1]))
+                if y_bin.shape[1] == 1:
+                    metrics["auc"] = roc_auc_score(all_labels, all_probs[:, 1]) * 100
+                else:
+                    metrics["auc"] = roc_auc_score(y_bin, all_probs, average='macro', multi_class='ovr') * 100
+            else:
+                metrics["auc"] = -1
+        except:
+            metrics["auc"] = -1
+    
+    return avg_loss, acc, metrics
 
 
 # ==================== EEGNet Configuration per Task ====================
@@ -526,7 +655,7 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
         datasets, 
         batch_size=config['batch_size'],
         num_workers=4,
-        augment_train=True,
+        augment_train=False,
         seed=seed
     )
     
@@ -605,7 +734,8 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
         raise ValueError(f"Invalid scheduler: {scheduler_type}")
     
     # ====== Training Loop ======
-    best_val_acc = 0
+    best_score = -1.0
+    best_thr_for_ckpt = 0.5
     patience_counter = 0
     
     if model_path is None:
@@ -615,7 +745,13 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
         print(f"\nEpoch [{epoch+1}/{config['num_epochs']}]")
         
         train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, is_binary=is_binary)
-        val_loss, val_acc = evaluate(model, val_loader, device, criterion, is_binary=is_binary)
+        
+        # Evaluate with threshold optimization for binary classification
+        val_loss, val_acc, val_metrics = evaluate(
+            model, val_loader, device, criterion,
+            is_binary=is_binary, return_metrics=True,
+            threshold=0.5, optimize_threshold=is_binary  # Binary: optimize threshold on val
+        )
         
         if scheduler_type == 'CosineAnnealingLR':
             scheduler.step()
@@ -627,21 +763,42 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
         print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
         print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%, LR: {current_lr:.6f}")
         
-        # Save best model
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        # Print additional metrics for binary classification
+        if is_binary and val_metrics:
+            print(f"Val F1: {val_metrics.get('f1', 0):.2f}%, "
+                  f"Recall: {val_metrics.get('recall', 0):.2f}%, "
+                  f"AUC: {val_metrics.get('auc', 0):.2f}%, "
+                  f"PR-AUC: {val_metrics.get('pr_auc', 0):.2f}%, "
+                  f"Threshold: {val_metrics.get('threshold', 0.5):.3f}")
+        
+        # Save best model: Use PR-AUC for P300 tasks, val_acc for others
+        if is_binary and task in ['P300', 'BNCI2014_P300', 'BI2014b_P300']:
+            # Use PR-AUC (preferred) or AUC as the saving criterion for imbalanced binary tasks
+            score = val_metrics.get("pr_auc", -1)
+            if score is None or score < 0:
+                score = val_metrics.get("auc", -1)
+        else:
+            # Multi-class or other binary tasks: use accuracy
+            score = val_acc
+        
+        if score > best_score:
+            best_score = score
+            best_thr_for_ckpt = val_metrics.get("threshold", 0.5) if is_binary else 0.5
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': unwrap_model(model).state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'best_val_acc': best_val_acc,
+                'best_score': best_score,
+                'best_val_acc': val_acc,
+                'best_threshold': best_thr_for_ckpt,  # Save optimal threshold
                 'task': task,
                 'config': config,
                 'eegnet_config': eegnet_config,
                 'n_channels': n_channels,
                 'n_samples': n_samples,
             }, model_path)
-            print(f"✓ Best model saved! ({val_acc:.2f}%)")
+            score_name = "PR-AUC" if (is_binary and task in ['P300', 'BNCI2014_P300', 'BI2014b_P300']) else "Acc"
+            print(f"✓ Best model saved! ({score_name}={best_score:.2f}, thr={best_thr_for_ckpt:.3f})")
             patience_counter = 0
         else:
             patience_counter += 1
@@ -659,26 +816,92 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
     checkpoint = torch.load(model_path)
     unwrap_model(model).load_state_dict(checkpoint['model_state_dict'])
     
-    results = {'val': best_val_acc}
+    # Get best threshold from checkpoint (or re-optimize on val)
+    best_thr = checkpoint.get("best_threshold", 0.5)
+    
+    # Re-optimize threshold on validation set for final evaluation
+    val_loss, val_acc, val_metrics = evaluate(
+        model, val_loader, device, criterion,
+        is_binary=is_binary, return_metrics=True,
+        threshold=best_thr, optimize_threshold=is_binary  # Re-optimize on val
+    )
+    best_thr = val_metrics.get("threshold", best_thr) if is_binary else 0.5
+    
+    results = {
+        'val': checkpoint.get('best_val_acc', val_acc),
+        'val_f1': val_metrics.get('f1'),
+        'val_recall': val_metrics.get('recall'),
+        'val_auc': val_metrics.get('auc'),
+        'val_pr_auc': val_metrics.get('pr_auc') if is_binary else None,
+    }
     
     if test1_loader:
-        test1_loss, test1_acc = evaluate(model, test1_loader, device, criterion, is_binary=is_binary)
+        # Test1: Use best threshold from validation (no optimization)
+        test1_loss, test1_acc, test1_metrics = evaluate(
+            model, test1_loader, device, criterion,
+            is_binary=is_binary, return_metrics=True,
+            threshold=best_thr, optimize_threshold=False
+        )
         results['test1'] = test1_acc
         results['test1_loss'] = test1_loss
+        results['test1_f1'] = test1_metrics.get('f1')
+        results['test1_recall'] = test1_metrics.get('recall')
+        results['test1_auc'] = test1_metrics.get('auc')
+        results['test1_pr_auc'] = test1_metrics.get('pr_auc') if is_binary else None
     
     if test2_loader:
-        test2_loss, test2_acc = evaluate(model, test2_loader, device, criterion, is_binary=is_binary)
+        # Test2: Use best threshold from validation (no optimization)
+        test2_loss, test2_acc, test2_metrics = evaluate(
+            model, test2_loader, device, criterion,
+            is_binary=is_binary, return_metrics=True,
+            threshold=best_thr, optimize_threshold=False
+        )
         results['test2'] = test2_acc
         results['test2_loss'] = test2_loss
+        results['test2_f1'] = test2_metrics.get('f1')
+        results['test2_recall'] = test2_metrics.get('recall')
+        results['test2_auc'] = test2_metrics.get('auc')
+        results['test2_pr_auc'] = test2_metrics.get('pr_auc') if is_binary else None
     
     print(f"\n{'='*70}")
     print(f"FINAL RESULTS - {task} (EEGNet)")
     print(f"{'='*70}")
-    print(f"Best Val Acc:    {best_val_acc:.2f}%")
+    if is_binary:
+        print(f"Best Threshold:  {best_thr:.3f}")
+        print(f"Val Acc:         {val_acc:.2f}%")
+        if results.get('val_f1') is not None:
+            print(f"Val F1:          {results['val_f1']:.2f}%")
+            print(f"Val Recall:      {results['val_recall']:.2f}%")
+            print(f"Val Precision:   {val_metrics.get('precision', 0):.2f}%")
+            if results.get('val_auc') is not None:
+                print(f"Val AUC:         {results['val_auc']:.2f}%")
+            if results.get('val_pr_auc') is not None:
+                print(f"Val PR-AUC:      {results['val_pr_auc']:.2f}%")
+    else:
+        print(f"Best Val Acc:    {checkpoint.get('best_val_acc', val_acc):.2f}%")
+        if results.get('val_f1') is not None:
+            print(f"Val F1:          {results['val_f1']:.2f}%")
+            print(f"Val Recall:      {results['val_recall']:.2f}%")
+            if results.get('val_auc') is not None and results['val_auc'] > 0:
+                print(f"Val AUC:         {results['val_auc']:.2f}%")
     if 'test1' in results:
-        print(f"Test1 (Seen):    {results['test1']:.2f}% (loss {results['test1_loss']:.4f})")
+        print(f"\nTest1 (Seen):    {results['test1']:.2f}% (loss {results['test1_loss']:.4f})")
+        if results.get('test1_f1') is not None:
+            print(f"  Test1 F1:      {results['test1_f1']:.2f}%")
+            print(f"  Test1 Recall:  {results['test1_recall']:.2f}%")
+            if results.get('test1_auc') is not None:
+                print(f"  Test1 AUC:     {results['test1_auc']:.2f}%")
+            if results.get('test1_pr_auc') is not None:
+                print(f"  Test1 PR-AUC:  {results['test1_pr_auc']:.2f}%")
     if 'test2' in results:
-        print(f"Test2 (Unseen):  {results['test2']:.2f}% (loss {results['test2_loss']:.4f})")
+        print(f"\nTest2 (Unseen):  {results['test2']:.2f}% (loss {results['test2_loss']:.4f})")
+        if results.get('test2_f1') is not None:
+            print(f"  Test2 F1:      {results['test2_f1']:.2f}%")
+            print(f"  Test2 Recall:  {results['test2_recall']:.2f}%")
+            if results.get('test2_auc') is not None:
+                print(f"  Test2 AUC:     {results['test2_auc']:.2f}%")
+            if results.get('test2_pr_auc') is not None:
+                print(f"  Test2 PR-AUC:  {results['test2_pr_auc']:.2f}%")
     print(f"{'='*70}")
     
     return model, results

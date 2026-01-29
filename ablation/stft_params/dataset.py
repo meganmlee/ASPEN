@@ -62,7 +62,7 @@ TASK_CONFIGS = {
         "num_subjects": 10,
         "num_seen": 7,
         "data_dir": "/ocean/projects/cis250213p/shared/bnci2014_p300",
-        "sampling_rate": 512,
+        "sampling_rate": 256,  # Fixed: Original data is 256Hz, no resampling
         "stft_nperseg": 256,
         "stft_noverlap": 240,
         "stft_nfft": 512,
@@ -72,7 +72,7 @@ TASK_CONFIGS = {
         "num_subjects": 38,
         "num_seen": 30,
         "data_dir": "/ocean/projects/cis250213p/shared/bi2014b_processed",
-        "sampling_rate": 256,
+        "sampling_rate": 512,
         "stft_nperseg": 64,
         "stft_noverlap": 56,
         "stft_nfft": 256,
@@ -594,13 +594,10 @@ def load_bnci_p300(data_dir: str, num_seen: int = 7, seed: int = 44) -> Dict:
                 label = 1 if stim_raw[start] == 1 else 0
                 
                 # Extract 1s window @ 256Hz (256 samples)
+                # No resampling - use original 256 samples with sampling_rate=256
                 end = start + 256 
                 if end <= raw_x.shape[0]:
                     trial = raw_x[start:end, :].T # (16, 256)
-                    
-                    # Resample to 512 samples to match the 512Hz Task Config
-                    # This ensures consistency with your STFT parameters
-                    trial = signal.resample(trial, 512, axis=-1)
                     
                     sub_x.append(trial.astype(np.float32))
                     sub_y.append(label)

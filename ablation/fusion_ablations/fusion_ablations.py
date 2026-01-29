@@ -1,16 +1,15 @@
 """
-Standalone Fusion Ablation Study for EEG Classification - WITH RESNET + TRANSFORMER
+Standalone Fusion Ablation Study for EEG Classification
 
-Self-contained script to test 7 different fusion strategies:
+Self-contained script to test 6 different fusion strategies:
 1. static - Equal 0.5/0.5 weighting
 2. global_attention - Trial-level dynamic weighting
 3. spatial_attention - Channel-level dynamic weighting  
 4. glu - Gated Linear Unit (noise suppression)
 5. multiplicative - Element-wise feature interaction
 6. bilinear - Full pairwise interaction
-7. transformer - Cross-attention with global weighting (NEW!)
 
-Includes ResNet blocks in spectral stream for deeper feature learning!
+No dependencies on other model files - completely standalone!
 """
 
 import torch
@@ -22,15 +21,16 @@ import sys
 import pandas as pd
 from tqdm import tqdm
 from typing import Dict, Optional
-from sklearn.metrics import f1_score, recall_score, roc_auc_score
+from sklearn.metrics import f1_score, recall_score, roc_auc_score, average_precision_score
 import matplotlib.pyplot as plt
 import seaborn as sns
 import mne
 
-# Import utilities
+# Import only utilities (assumed available)
 scale_net_path = os.path.join(os.path.dirname(__file__), '..', '..', 'scale_net')
 sys.path.insert(0, scale_net_path)
 
+# Import from scale-net
 from seed_utils import seed_everything
 from dataset import load_dataset, TASK_CONFIGS, create_dataloaders
 
@@ -56,59 +56,19 @@ class SqueezeExcitation(nn.Module):
         return x * y.expand_as(x)
 
 
-# ==================== ResNet Block ====================
-
-class SpectralResidualBlock(nn.Module):
-    """
-    Residual block for spectral stream - inspired by ResNet
-    Improves gradient flow and allows deeper networks
-    """
-    def __init__(self, channels, dropout=0.25):
-        super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(channels)
-        self.se = SqueezeExcitation(channels, reduction=4)
-        self.dropout = nn.Dropout2d(dropout)
-        
-    def forward(self, x):
-        residual = x
-        
-        # First conv block
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = F.relu(out, inplace=True)
-        out = self.dropout(out)
-        
-        # Second conv block
-        out = self.conv2(out)
-        out = self.bn2(out)
-        
-        # SE attention
-        out = self.se(out)
-        
-        # Residual connection
-        out = out + residual
-        out = F.relu(out, inplace=True)
-        
-        return out
-
-
 # ==================== Fusion Strategies ====================
 
 class FusionAblations(nn.Module):
     """
-    Implements 7 strategies for multimodal fusion ablation:
+    Implements 6 strategies for multimodal fusion ablation:
     1. 'static': Linear equal weighting (0.5/0.5)
     2. 'global_attention': Trial-level dynamic weighting
     3. 'spatial_attention': Channel-level dynamic weighting
     4. 'glu': Gated Linear Unit for noise suppression
     5. 'multiplicative': Simple element-wise product interaction
     6. 'bilinear': Full pairwise feature interaction
-    7. 'transformer': Cross-attention + global weighting (NEW!)
     """
-    def __init__(self, mode, dim, n_channels=None, temperature=2.0, rank=16, num_heads=4, dropout=0.1):
+    def __init__(self, mode, dim, n_channels=None, temperature=2.0, rank=16):
         super().__init__()
         self.mode = mode
         self.dim = dim
@@ -130,46 +90,25 @@ class FusionAblations(nn.Module):
             self.U_s = nn.Linear(dim, rank, bias=False)
             self.U_t = nn.Linear(dim, rank, bias=False)
             self.out_proj = nn.Linear(rank, dim)
-        elif mode == 'transformer':
-            # Cross-attention branch
-            self.mha = nn.MultiheadAttention(
-                embed_dim=dim, 
-                num_heads=num_heads, 
-                batch_first=True,
-                dropout=dropout
-            )
-            self.norm1 = nn.LayerNorm(dim)
-            self.norm2 = nn.LayerNorm(dim)
-            self.ffn = nn.Sequential(
-                nn.Linear(dim, dim * 2),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(dim * 2, dim)
-            )
-            self.dropout_layer = nn.Dropout(dropout)
-            
-            # Global weighting branch (for interpretability)
-            self.global_attn = nn.Sequential(
-                nn.Linear(dim * 2, dim),
-                nn.ReLU(),
-                nn.Dropout(dropout * 0.5),
-                nn.Linear(dim, 2)
-            )
 
     def forward(self, x_s, x_t):
         if self.mode == 'static':
             return 0.5 * x_s + 0.5 * x_t, None
             
         elif self.mode == 'global_attention':
+            # Average across channels to get trial-level context
             ctx = torch.cat([x_s.mean(1), x_t.mean(1)], dim=-1)
             attn_logits = self.attn(ctx) / self.temperature
             w = torch.softmax(attn_logits, dim=-1)  # (B, 2)
+            # Same weights for all channels in a trial
             return w[:, 0].view(-1, 1, 1) * x_s + w[:, 1].view(-1, 1, 1) * x_t, w
             
         elif self.mode == 'spatial_attention':
+            # Keep channel dimension for channel-specific weighting
             ctx = torch.cat([x_s, x_t], dim=-1)  # (B, C, dim*2)
             attn_logits = self.attn(ctx) / self.temperature  # (B, C, 2)
             w = torch.softmax(attn_logits, dim=-1)  # (B, C, 2)
+            # Different weights per channel
             return w[:, :, 0].unsqueeze(-1) * x_s + w[:, :, 1].unsqueeze(-1) * x_t, w
             
         elif self.mode == 'glu':
@@ -186,37 +125,18 @@ class FusionAblations(nn.Module):
             z = z_s * z_t            # Element-wise product
             fused = self.out_proj(z) # (B, C, dim)
             return fused, None
-            
-        elif self.mode == 'transformer':
-            # Cross-attention fusion
-            attn_out, _ = self.mha(query=x_s, key=x_t, value=x_t)
-            x_cross = self.norm1(x_s + self.dropout_layer(attn_out))
-            x_fused = self.norm2(x_cross + self.dropout_layer(self.ffn(x_cross)))
-            
-            # Global stream weights (for interpretability)
-            ctx = torch.cat([x_s.mean(dim=1), x_t.mean(dim=1)], dim=-1)
-            logits = self.global_attn(ctx) / self.temperature  # (B, 2)
-            w = torch.softmax(logits, dim=-1)  # (B, 2)
-            
-            # Combine with global weights
-            output = (
-                w[:, 0].view(-1, 1, 1) * x_fused +
-                w[:, 1].view(-1, 1, 1) * x_t
-            )
-            
-            return output, w  # w is (B, 2): [Spectral_Weight, Temporal_Weight]
 
 
-# ==================== Dual-Stream EEG Model with ResNet ====================
+# ==================== Dual-Stream EEG Model ====================
 
 class DualStreamEEGModel(nn.Module):
     """
-    Dual-stream EEG model with ResNet blocks and configurable fusion
+    Dual-stream EEG model with configurable fusion strategy
     
     Architecture:
-    - Spectral Stream: 2D CNN with ResNet blocks on STFT features
+    - Spectral Stream: 2D CNN on STFT features
     - Temporal Stream: EEGNet-style 1D CNN on raw EEG
-    - Fusion: One of 7 strategies (configurable)
+    - Fusion: One of 6 strategies (configurable)
     - LSTM: Temporal aggregation across channels
     - Classifier: Final prediction
     """
@@ -224,42 +144,28 @@ class DualStreamEEGModel(nn.Module):
     def __init__(self, freq_bins, time_bins, n_channels, n_classes, T_raw,
                  cnn_filters=16, lstm_hidden=128, pos_dim=16,
                  dropout=0.3, cnn_dropout=0.2, use_hidden_layer=False, hidden_dim=64,
-                 fusion_mode='transformer', fusion_temperature=2.0, fusion_rank=16,
-                 use_resnet=True):
+                 fusion_mode='global_attention', fusion_temperature=2.0, fusion_rank=16):
         
         super().__init__()
         self.n_channels = n_channels
         self.T_raw = T_raw
         self.fusion_mode = fusion_mode
-        self.use_resnet = use_resnet
         
-        # ====== SPECTRAL STREAM (2D CNN with ResNet) ======
+        # ====== SPECTRAL STREAM (2D CNN) ======
         self.spec_cnn_filters = cnn_filters * 2
         
-        # Stage 1: Initial Conv
+        # Stage 1: Conv(1→16) + BN + ReLU + SE + Dropout + Pool
         self.spec_conv1 = nn.Conv2d(1, cnn_filters, kernel_size=7, padding=3, bias=False)
         self.spec_bn1 = nn.BatchNorm2d(cnn_filters)
         self.spec_se1 = SqueezeExcitation(cnn_filters, reduction=4)
         self.spec_dropout_cnn1 = nn.Dropout2d(cnn_dropout)
-        
-        # Add residual blocks for Stage 1
-        if use_resnet:
-            self.spec_res1 = SpectralResidualBlock(cnn_filters, dropout=cnn_dropout)
-            self.spec_res2 = SpectralResidualBlock(cnn_filters, dropout=cnn_dropout)
-        
         self.spec_pool1 = nn.MaxPool2d(2)
         
-        # Stage 2: Conv
+        # Stage 2: Conv(16→32) + BN + ReLU + SE + Dropout + Pool
         self.spec_conv2 = nn.Conv2d(cnn_filters, self.spec_cnn_filters, kernel_size=5, padding=2, bias=False)
         self.spec_bn2 = nn.BatchNorm2d(self.spec_cnn_filters)
         self.spec_se2 = SqueezeExcitation(self.spec_cnn_filters, reduction=4)
         self.spec_dropout_cnn2 = nn.Dropout2d(cnn_dropout)
-        
-        # Add residual blocks for Stage 2
-        if use_resnet:
-            self.spec_res3 = SpectralResidualBlock(self.spec_cnn_filters, dropout=cnn_dropout)
-            self.spec_res4 = SpectralResidualBlock(self.spec_cnn_filters, dropout=cnn_dropout)
-        
         self.spec_pool2 = nn.MaxPool2d(2)
         
         # Spectral CNN Output Dimension
@@ -270,13 +176,16 @@ class DualStreamEEGModel(nn.Module):
         D = 2
         F2 = F1 * D
         
+        # Layer 1: Temporal Conv
         self.temp_conv = nn.Conv2d(1, F1, (1, 64), padding=(0, 32), bias=False)
         self.bn_temp = nn.BatchNorm2d(F1)
         
+        # Layer 2: Spatial Conv (Depthwise)
         self.spatial_conv = nn.Conv2d(F1, F2, (n_channels, 1), groups=F1, bias=False)
         self.bn_spatial = nn.BatchNorm2d(F2)
         self.pool_spatial = nn.AvgPool2d((1, 4))
         
+        # Layer 3: Separable Conv
         self.separable_conv = nn.Sequential(
             nn.Conv2d(F2, F2, (1, 16), padding=(0, 8), groups=F2, bias=False),
             nn.Conv2d(F2, F2, (1, 1), bias=False),
@@ -286,18 +195,13 @@ class DualStreamEEGModel(nn.Module):
             nn.Dropout(cnn_dropout)
         )
         
+        # Calculate temporal stream output dimension
         final_time_dim = (T_raw // 4) // 8
         self.time_out_dim = F2 * final_time_dim
 
         # ====== FEATURE PROJECTION ======
-        self.proj_spec = nn.Sequential(
-            nn.Linear(self.spec_out_dim, lstm_hidden),
-            nn.Dropout(0.2)
-        )
-        self.proj_time = nn.Sequential(
-            nn.Linear(self.time_out_dim, lstm_hidden),
-            nn.Dropout(0.2)
-        )
+        self.proj_spec = nn.Linear(self.spec_out_dim, lstm_hidden)
+        self.proj_time = nn.Linear(self.time_out_dim, lstm_hidden)
 
         # ====== FUSION LAYER ======
         self.fusion_layer = FusionAblations(
@@ -305,9 +209,7 @@ class DualStreamEEGModel(nn.Module):
             dim=lstm_hidden,
             n_channels=n_channels,
             temperature=fusion_temperature,
-            rank=fusion_rank,
-            num_heads=4,
-            dropout=dropout
+            rank=fusion_rank
         )
 
         # Channel Position Embedding
@@ -350,44 +252,43 @@ class DualStreamEEGModel(nn.Module):
     def forward(self, x_time, x_spec, chan_ids=None):
         B, C, _, _ = x_spec.shape
 
-        # ====== 1. SPECTRAL STREAM (with ResNet) ======
+        # ====== 1. SPECTRAL STREAM ======
         x_spec_feat = x_spec.view(B * C, 1, x_spec.size(2), x_spec.size(3))
         
         # Stage 1
         x_spec_feat = self.spec_conv1(x_spec_feat)
-        x_spec_feat = F.relu(self.spec_bn1(x_spec_feat))
+        x_spec_feat = self.spec_bn1(x_spec_feat)
+        x_spec_feat = F.relu(x_spec_feat, inplace=True)
         x_spec_feat = self.spec_se1(x_spec_feat)
         x_spec_feat = self.spec_dropout_cnn1(x_spec_feat)
-        
-        if self.use_resnet:
-            x_spec_feat = self.spec_res1(x_spec_feat)
-            x_spec_feat = self.spec_res2(x_spec_feat)
-        
         x_spec_feat = self.spec_pool1(x_spec_feat)
         
         # Stage 2
         x_spec_feat = self.spec_conv2(x_spec_feat)
-        x_spec_feat = F.relu(self.spec_bn2(x_spec_feat))
+        x_spec_feat = self.spec_bn2(x_spec_feat)
+        x_spec_feat = F.relu(x_spec_feat, inplace=True)
         x_spec_feat = self.spec_se2(x_spec_feat)
         x_spec_feat = self.spec_dropout_cnn2(x_spec_feat)
-        
-        if self.use_resnet:
-            x_spec_feat = self.spec_res3(x_spec_feat)
-            x_spec_feat = self.spec_res4(x_spec_feat)
-        
         x_spec_feat = self.spec_pool2(x_spec_feat)
+        
         x_spec_feat = x_spec_feat.view(B, C, -1)
 
         # ====== 2. TEMPORAL STREAM ======
         x_global = x_time.unsqueeze(1)
-        x_global = self.bn_temp(self.temp_conv(x_global))
-        x_global = self.pool_spatial(F.relu(self.bn_spatial(self.spatial_conv(x_global))))
+        
+        x_global = self.temp_conv(x_global)
+        x_global = self.bn_temp(x_global)
+        
+        x_global = self.spatial_conv(x_global)
+        x_global = F.relu(self.bn_spatial(x_global))
+        x_global = self.pool_spatial(x_global)
+        
         x_global = self.separable_conv(x_global)
         x_global = x_global.view(B, -1)
         
         # ====== 3. FEATURE PROJECTION ======
         x_spec_proj = self.proj_spec(x_spec_feat)  # (B, C, lstm_hidden)
-        x_global_proj = self.proj_time(x_global).unsqueeze(1).expand(-1, C, -1)  # (B, C, lstm_hidden)
+        x_global_proj = self.proj_time(x_global.unsqueeze(1).expand(-1, C, -1))  # (B, C, lstm_hidden)
         
         # ====== 4. FUSION ======
         features, weights = self.fusion_layer(x_spec_proj, x_global_proj)
@@ -446,10 +347,27 @@ def train_epoch(model, loader, criterion, optimizer, device, is_binary=False):
     return total_loss / len(loader), 100 * correct / total
 
 
-def evaluate(model, loader, device, criterion, is_binary=False):
-    """Evaluate model"""
+def evaluate(model, loader, device, criterion, is_binary=False, return_metrics=False):
+    """
+    Evaluate model
+    
+    Args:
+        model: Model to evaluate
+        loader: DataLoader
+        device: Device to run on
+        criterion: Loss function
+        is_binary: Whether this is binary classification
+        return_metrics: If True, return additional metrics (f1, recall, auc, pr_auc)
+    
+    Returns:
+        If return_metrics=False: (avg_loss, acc)
+        If return_metrics=True: (avg_loss, acc, metrics_dict)
+    """
     model.eval()
     total_loss, correct, total = 0, 0, 0
+    all_preds = []
+    all_probs = []
+    all_labels = []
     
     with torch.no_grad():
         for (x_time, x_spec), labels in loader:
@@ -465,14 +383,60 @@ def evaluate(model, loader, device, criterion, is_binary=False):
             total_loss += loss.item()
             
             if is_binary:
-                preds = (torch.sigmoid(outputs) > 0.5).long().squeeze()
+                probs = torch.sigmoid(outputs).squeeze(1)
+                preds = (probs > 0.5).long()
+                if return_metrics:
+                    all_probs.append(probs.cpu().numpy())
             else:
+                probs = F.softmax(outputs, dim=1)
                 preds = outputs.argmax(dim=1)
+                if return_metrics:
+                    all_probs.append(probs.cpu().numpy())
+            
+            if return_metrics:
+                all_preds.append(preds.cpu().numpy())
+                all_labels.append(labels.cpu().numpy())
             
             correct += (preds == labels).sum().item()
             total += labels.size(0)
     
-    return total_loss / len(loader), 100 * correct / total
+    avg_loss = total_loss / len(loader)
+    acc = 100 * correct / total
+    
+    if not return_metrics:
+        return avg_loss, acc
+    
+    # Calculate additional metrics
+    all_preds = np.concatenate(all_preds)
+    all_labels = np.concatenate(all_labels)
+    all_probs = np.concatenate(all_probs)
+    
+    metrics = {}
+    
+    # F1 score (macro average for multi-class, binary for binary)
+    if is_binary:
+        metrics["f1"] = f1_score(all_labels, all_preds, average="binary", zero_division=0) * 100
+        metrics["recall"] = recall_score(all_labels, all_preds, average="binary", zero_division=0) * 100
+        metrics["auc"] = roc_auc_score(all_labels, all_probs) * 100
+        metrics["pr_auc"] = average_precision_score(all_labels, all_probs) * 100
+    else:
+        metrics["f1"] = f1_score(all_labels, all_preds, average="macro", zero_division=0) * 100
+        metrics["recall"] = recall_score(all_labels, all_preds, average="macro", zero_division=0) * 100
+        # Multi-class AUC calculation (one-vs-rest)
+        try:
+            if all_probs.ndim == 2 and all_probs.shape[1] > 2:
+                from sklearn.preprocessing import label_binarize
+                y_bin = label_binarize(all_labels, classes=np.arange(all_probs.shape[1]))
+                if y_bin.shape[1] == 1:
+                    metrics["auc"] = roc_auc_score(all_labels, all_probs[:, 1]) * 100
+                else:
+                    metrics["auc"] = roc_auc_score(y_bin, all_probs, average='macro', multi_class='ovr') * 100
+            else:
+                metrics["auc"] = -1
+        except:
+            metrics["auc"] = -1
+    
+    return avg_loss, acc, metrics
 
 
 def evaluate_comprehensive(model, loader, device, is_binary=False):
@@ -499,8 +463,8 @@ def evaluate_comprehensive(model, loader, device, is_binary=False):
     avg_type = 'binary' if is_binary else 'macro'
     metrics = {
         'acc': np.mean(np.array(all_preds) == np.array(all_labels)) * 100,
-        'f1': f1_score(all_labels, all_preds, average=avg_type, zero_division=0) * 100,
-        'recall': recall_score(all_labels, all_preds, average=avg_type, zero_division=0) * 100,
+        'f1': f1_score(all_labels, all_preds, average=avg_type) * 100,
+        'recall': recall_score(all_labels, all_preds, average=avg_type) * 100,
     }
     
     try:
@@ -514,7 +478,7 @@ def evaluate_comprehensive(model, loader, device, is_binary=False):
     return metrics
 
 
-# ====== Feature Statistics Collection (same as before) ======
+# ==================== Feature Statistics Collection ====================
 
 def collect_feature_statistics(model, loader, device, fusion_mode):
     """Collect fusion statistics and attention weights"""
@@ -527,7 +491,7 @@ def collect_feature_statistics(model, loader, device, fusion_mode):
         'confidences': []
     }
     
-    if fusion_mode in ['global_attention', 'spatial_attention', 'transformer']:
+    if fusion_mode in ['global_attention', 'spatial_attention']:
         stats['attn_weights'] = []
     if fusion_mode == 'spatial_attention':
         stats['spatial_weights'] = []
@@ -540,31 +504,33 @@ def collect_feature_statistics(model, loader, device, fusion_mode):
             x_time, x_spec = x_time.to(device), x_spec.to(device)
             B, C = x_spec.shape[0], x_spec.shape[1]
             
-            # Get projected features
+            # Get projected features manually to calculate contributions
             x_spec_f = x_spec.view(B * C, 1, x_spec.size(2), x_spec.size(3))
-            x_spec_f = F.relu(model.spec_bn1(model.spec_conv1(x_spec_f)))
+            x_spec_f = model.spec_conv1(x_spec_f)
+            x_spec_f = model.spec_bn1(x_spec_f)
+            x_spec_f = F.relu(x_spec_f)
             x_spec_f = model.spec_se1(x_spec_f)
-            if model.use_resnet:
-                x_spec_f = model.spec_res1(x_spec_f)
-                x_spec_f = model.spec_res2(x_spec_f)
             x_spec_f = model.spec_pool1(x_spec_f)
-            x_spec_f = F.relu(model.spec_bn2(model.spec_conv2(x_spec_f)))
+            x_spec_f = model.spec_conv2(x_spec_f)
+            x_spec_f = model.spec_bn2(x_spec_f)
+            x_spec_f = F.relu(x_spec_f)
             x_spec_f = model.spec_se2(x_spec_f)
-            if model.use_resnet:
-                x_spec_f = model.spec_res3(x_spec_f)
-                x_spec_f = model.spec_res4(x_spec_f)
             x_spec_f = model.spec_pool2(x_spec_f)
             x_spec_proj = model.proj_spec(x_spec_f.view(B, C, -1))
             
             x_g = x_time.unsqueeze(1)
-            x_g = model.bn_temp(model.temp_conv(x_g))
-            x_g = model.pool_spatial(F.relu(model.bn_spatial(model.spatial_conv(x_g))))
+            x_g = model.temp_conv(x_g)
+            x_g = model.bn_temp(x_g)
+            x_g = model.spatial_conv(x_g)
+            x_g = F.relu(model.bn_spatial(x_g))
+            x_g = model.pool_spatial(x_g)
             x_g = model.separable_conv(x_g)
-            x_global_proj = model.proj_time(x_g.view(B, -1)).unsqueeze(1).expand(-1, C, -1)
+            x_global_proj = model.proj_time(x_g.view(B, -1).unsqueeze(1).expand(-1, C, -1))
             
             _, weights = model.fusion_layer(x_spec_proj, x_global_proj)
 
             if fusion_mode == 'spatial_attention' and weights is not None:
+                # weights shape is (B, C, 2) - take spectral weights
                 stats['spatial_weights'].append(weights[:, :, 0].cpu().numpy())
             
             # Calculate contribution magnitudes
@@ -592,6 +558,7 @@ def collect_feature_statistics(model, loader, device, fusion_mode):
                     stats['gate_values'].append(weights.cpu().numpy())
                     stats['gate_sparsity'].append((weights < 0.1).float().mean().cpu().item())
 
+    # Concatenate all arrays
     return {
         k: np.concatenate(v, axis=0) if (len(v) > 0 and isinstance(v[0], np.ndarray))
         else np.array(v)
@@ -623,7 +590,7 @@ def analyze_fusion_statistics(stats, fusion_mode, task):
     return analysis
 
 
-# ====== Visualization Functions (same as before) ======
+# ==================== Visualization ====================
 
 def plot_modality_contributions(task, results_df):
     """Plot modality contribution balance across strategies"""
@@ -644,15 +611,14 @@ def plot_modality_contributions(task, results_df):
                 'Modality': 'Temporal'
             })
     
-    plt.figure(figsize=(14, 6))
+    plt.figure(figsize=(12, 6))
     sns.set_style("whitegrid")
     df = pd.DataFrame(plot_data)
     sns.barplot(x='Strategy', y='Contribution', hue='Modality', data=df, palette='viridis')
-    plt.title(f'Modality Usage Balance - {task} (with ResNet + Transformer)', fontsize=14, fontweight='bold')
+    plt.title(f'Modality Usage Balance - {task}', fontsize=14, fontweight='bold')
     plt.ylim(0, 1.0)
     plt.ylabel('Contribution', fontsize=12)
     plt.xlabel('Fusion Strategy', fontsize=12)
-    plt.xticks(rotation=45, ha='right')
     
     # Add accuracy annotations
     for i, row in results_df.iterrows():
@@ -667,7 +633,10 @@ def plot_modality_contributions(task, results_df):
 
 
 def plot_spatial_attention_heatmap(task, stats, n_channels):
-    """Plot spatial attention heatmap (brain topomap + grid)"""
+    """
+    Plots both a topographical brain map and a named grid map of attention weights.
+    Categorizes channel types to prevent overlapping position errors in MNE.
+    """
     if 'spatial_weights' not in stats:
         print(f"No spatial weights found for {task}. Skipping heatmap.")
         return
@@ -675,9 +644,11 @@ def plot_spatial_attention_heatmap(task, stats, n_channels):
     save_dir = f'./ablation_{task}/plots'
     os.makedirs(save_dir, exist_ok=True)
     
+    # Average weights across all trials in the test set
     mean_weights = stats['spatial_weights'].mean(axis=0)
 
     if n_channels == 64 or n_channels == 62: 
+        # Base 60 EEG channels common to both
         eeg_names = [
             'Fp1', 'Fpz', 'Fp2', 'AF3', 'AF4', 'F7', 'F5', 'F3', 'F1', 'Fz', 
             'F2', 'F4', 'F6', 'F8', 'FT7', 'FC5', 'FC3', 'FC1', 'FCz', 'FC2', 
@@ -687,14 +658,15 @@ def plot_spatial_attention_heatmap(task, stats, n_channels):
             'PO7', 'PO5', 'PO3', 'POz', 'PO4', 'PO6', 'PO8', 'O1', 'Oz', 'O2'
         ]
         
-        if n_channels == 64:
+        if n_channels == 64: # Wang2016 specific additions
             ch_names = eeg_names + ['CB1', 'CB2', 'VEO', 'HEO']
-        else:
+        else: # Lee2019 specific (62 channels total)
             ch_names = eeg_names + ['VEO', 'HEO']
             
+        # Assign types: EEG for the first 60, EOG/Misc for the rest
         ch_types = ['eeg'] * 60 + ['eog'] * (n_channels - 60)
             
-    elif n_channels == 22:
+    elif n_channels == 22:  # MI: BNCI2014_001
         ch_names = [
             'Fz', 'FC3', 'FC1', 'FCz', 'FC2', 'FC4', 'C5', 'C3', 'C1', 'Cz',
             'C2', 'C4', 'C6', 'CP3', 'CP1', 'CPz', 'CP2', 'CP4', 'P1', 'Pz',
@@ -702,7 +674,7 @@ def plot_spatial_attention_heatmap(task, stats, n_channels):
         ]
         ch_types = ['eeg'] * 22
         
-    elif n_channels == 32:
+    elif n_channels == 32:  # P300: BI2014B
         ch_names = [
             'Fp1', 'Fp2', 'AF3', 'AF4', 'F7', 'F3', 'Fz', 'F4', 'F8', 'FC5', 
             'FC1', 'FC2', 'FC6', 'T7', 'C3', 'Cz', 'C4', 'T8', 'CP5', 'CP1', 
@@ -711,7 +683,7 @@ def plot_spatial_attention_heatmap(task, stats, n_channels):
         ]
         ch_types = ['eeg'] * 32
 
-    elif n_channels == 16:
+    elif n_channels == 16: # P300: BNCI2014_009
         ch_names = [
             'Fz', 'FCz', 'Cz', 'CPz', 'Pz', 'Oz', 'F3', 'F4', 
             'C3', 'C4', 'P3', 'P4', 'PO7', 'PO8', 'O1', 'O2'
@@ -722,11 +694,13 @@ def plot_spatial_attention_heatmap(task, stats, n_channels):
         ch_names = [f'EEG{i:03d}' for i in range(n_channels)]
         ch_types = ['eeg'] * n_channels
 
-    # Brain topomap
+    # ==================== PART 1: MNE BRAIN TOPOMAP ====================
+    # Create info with specific types to allow MNE to ignore eye/neck channels
     info = mne.create_info(ch_names=ch_names[:n_channels], sfreq=250, ch_types=ch_types)
     montage = mne.channels.make_standard_montage('standard_1020')
     info.set_montage(montage, on_missing='ignore')
 
+    # Pick only 'eeg' types to avoid the "overlapping positions" error
     eeg_picks = mne.pick_types(info, eeg=True, eog=False, misc=False)
     filtered_weights = mean_weights[eeg_picks]
     filtered_info = mne.pick_info(info, sel=eeg_picks)
@@ -745,10 +719,12 @@ def plot_spatial_attention_heatmap(task, stats, n_channels):
     plt.savefig(f'{save_dir}/{task}_brain_topomap.png', dpi=300)
     plt.close()
 
-    # Named grid map
+    # ==================== PART 2: NAMED GRID MAP ====================
+    # Calculate grid size (e.g., 5x5 for 22ch, 6x6 for 32ch, 8x8 for 64ch)
     cols = int(np.ceil(np.sqrt(n_channels)))
     rows = int(np.ceil(n_channels / cols))
     
+    # Pad weights and names to match rectangular grid
     padded_weights = np.zeros(rows * cols)
     padded_weights[:n_channels] = mean_weights
     
@@ -756,6 +732,7 @@ def plot_spatial_attention_heatmap(task, stats, n_channels):
     for i in range(n_channels):
         padded_names[i] = ch_names[i]
 
+    # Create annotation labels (Electrode Name + Weight Value)
     labels = np.array([f"{name}\n{val:.2f}" if name else "" 
                       for name, val in zip(padded_names, padded_weights)]).reshape(rows, cols)
     heatmap_data = padded_weights.reshape(rows, cols)
@@ -773,17 +750,15 @@ def plot_spatial_attention_heatmap(task, stats, n_channels):
 
 # ==================== Main Ablation Study ====================
 
-def run_ablation_study(task: str, config: Dict = None, use_resnet: bool = True):
+def run_ablation_study(task: str, config: Dict = None):
     """
-    Run fusion strategy ablation study with ResNet and Transformer
+    Run fusion strategy ablation study for a given task
     
     Args:
-        task: Task name
-        config: Configuration dictionary
-        use_resnet: Whether to use ResNet blocks in spectral stream
+        task: Task name (e.g., 'SSVEP', 'P300', 'MI', etc.)
+        config: Configuration dictionary with training/model parameters
     """
-    strategies = ['static', 'global_attention', 'spatial_attention', 'glu', 
-                  'multiplicative', 'bilinear', 'transformer']
+    strategies = ['static', 'global_attention', 'spatial_attention', 'glu', 'multiplicative', 'bilinear']
     
     if config is None:
         config = {
@@ -801,6 +776,7 @@ def run_ablation_study(task: str, config: Dict = None, use_resnet: bool = True):
             'patience': 5
         }
 
+    # Get task configuration
     task_config = TASK_CONFIGS.get(task, {})
     n_classes = task_config.get('num_classes', 26)
     is_binary = (n_classes == 2)
@@ -808,10 +784,9 @@ def run_ablation_study(task: str, config: Dict = None, use_resnet: bool = True):
     
     print(f"\n{'='*70}")
     print(f"FUSION ABLATION STUDY: {task}")
-    print(f"ResNet Blocks: {'✓ Enabled' if use_resnet else '✗ Disabled'}")
     print(f"{'='*70}")
     print(f"Device: {device}")
-    print(f"Testing {len(strategies)} fusion strategies (including Transformer!)")
+    print(f"Testing {len(strategies)} fusion strategies")
     print(f"{'='*70}\n")
     
     results_log = []
@@ -823,12 +798,14 @@ def run_ablation_study(task: str, config: Dict = None, use_resnet: bool = True):
         
         seed_everything(config['seed'], deterministic=True)
         
+        # Load dataset
         datasets = load_dataset(
             task=task,
             data_dir=task_config.get('data_dir'),
             seed=config['seed']
         )
 
+        # Auto-determine fusion rank based on dataset size
         n_train_samples = len(datasets['train'][0])
         if n_train_samples < 1000:
             fusion_rank = 8
@@ -837,6 +814,7 @@ def run_ablation_study(task: str, config: Dict = None, use_resnet: bool = True):
         else:
             fusion_rank = 32
         
+        # STFT config
         stft_config = {
             'fs': config.get('stft_fs', task_config.get('sampling_rate', 250)),
             'nperseg': config.get('stft_nperseg', task_config.get('stft_nperseg', 128)),
@@ -846,6 +824,7 @@ def run_ablation_study(task: str, config: Dict = None, use_resnet: bool = True):
         
         loaders = create_dataloaders(datasets, stft_config, batch_size=config['batch_size'])
         
+        # Get dimensions
         sample_x, _ = next(iter(loaders['train']))
         _, n_channels, T_raw = sample_x[0].shape
         _, _, freq_bins, time_bins = sample_x[1].shape
@@ -853,6 +832,7 @@ def run_ablation_study(task: str, config: Dict = None, use_resnet: bool = True):
         print(f"Data: {n_channels} channels, {n_classes} classes")
         print(f"Spectral: {freq_bins}x{time_bins}, Temporal: {T_raw} samples")
         
+        # Create model
         model = DualStreamEEGModel(
             freq_bins=freq_bins,
             time_bins=time_bins,
@@ -868,35 +848,58 @@ def run_ablation_study(task: str, config: Dict = None, use_resnet: bool = True):
             use_hidden_layer=config['use_hidden_layer'],
             hidden_dim=config['hidden_dim'],
             fusion_temperature=2.0,
-            fusion_rank=fusion_rank,
-            use_resnet=use_resnet
+            fusion_rank=fusion_rank
         ).to(device)
         
         n_params = sum(p.numel() for p in model.parameters())
         print(f"Model parameters: {n_params:,}")
         
+        # Training setup
         optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'])
         criterion = nn.BCEWithLogitsLoss() if is_binary else nn.CrossEntropyLoss()
         
+        # Training loop
+        best_score = -1.0
         best_val_acc = 0
         epochs_no_improve = 0
         patience = config.get('patience', 5)
         
-        model_save_path = f'./ablation_{task}/models/best_{task}_{strategy}_resnet{use_resnet}.pth'
+        model_save_path = f'./ablation_{task}/models/best_{task}_{strategy}.pth'
         os.makedirs(f'./ablation_{task}/models', exist_ok=True)
         
         for epoch in range(config['num_epochs']):
             train_loss, train_acc = train_epoch(model, loaders['train'], criterion, optimizer, device, is_binary)
-            val_loss, val_acc = evaluate(model, loaders['val'], device, criterion, is_binary)
+            val_loss, val_acc, val_metrics = evaluate(
+                model, loaders['val'], device, criterion, is_binary, return_metrics=True
+            )
             
             print(f"Epoch {epoch+1}/{config['num_epochs']} | "
                   f"Train: {train_acc:.2f}% | Val: {val_acc:.2f}%")
             
-            if val_acc > best_val_acc:
+            # Print additional metrics for binary classification
+            if is_binary and val_metrics:
+                print(f"  Val F1: {val_metrics.get('f1', 0):.2f}%, "
+                      f"Recall: {val_metrics.get('recall', 0):.2f}%, "
+                      f"AUC: {val_metrics.get('auc', 0):.2f}%, "
+                      f"PR-AUC: {val_metrics.get('pr_auc', 0):.2f}%")
+            
+            # Save best model: Use PR-AUC for P300 tasks, val_acc for others
+            if is_binary and task in ['P300', 'BNCI2014_P300', 'BI2014b_P300']:
+                # Use PR-AUC (preferred) or AUC as the saving criterion for imbalanced binary tasks
+                score = val_metrics.get("pr_auc", -1)
+                if score is None or score < 0:
+                    score = val_metrics.get("auc", -1)
+            else:
+                # Multi-class or other binary tasks: use accuracy
+                score = val_acc
+            
+            if score > best_score:
+                best_score = score
                 best_val_acc = val_acc
                 epochs_no_improve = 0
                 torch.save(model.state_dict(), model_save_path)
-                print(f"  → Best model saved! Val Acc: {val_acc:.2f}%")
+                score_name = "PR-AUC" if (is_binary and task in ['P300', 'BNCI2014_P300', 'BI2014b_P300']) else "Acc"
+                print(f"  → Best model saved! {score_name}: {best_score:.2f}, Val Acc: {val_acc:.2f}%")
             else:
                 epochs_no_improve += 1
             
@@ -904,14 +907,17 @@ def run_ablation_study(task: str, config: Dict = None, use_resnet: bool = True):
                 print(f"  → Early stopping (patience={patience})")
                 break
         
+        # Load best model
         model.load_state_dict(torch.load(model_save_path))
         
-        log_entry = {'strategy': strategy, 'val_acc': best_val_acc, 'use_resnet': use_resnet}
+        # Evaluate
+        log_entry = {'strategy': strategy, 'val_acc': best_val_acc}
         
         if 'test2' in loaders:
             test2_metrics = evaluate_comprehensive(model, loaders['test2'], device, is_binary)
             log_entry.update({f"test2_{k}": v for k, v in test2_metrics.items()})
             
+            # Collect statistics
             stats = collect_feature_statistics(model, loaders['test2'], device, strategy)
             analysis = analyze_fusion_statistics(stats, strategy, task)
             log_entry.update({
@@ -919,6 +925,7 @@ def run_ablation_study(task: str, config: Dict = None, use_resnet: bool = True):
                 'temporal_dominance': analysis['temporal_dominance']
             })
             
+            # Plot spatial attention if applicable
             if strategy == 'spatial_attention':
                 plot_spatial_attention_heatmap(task, stats, n_channels)
         
@@ -933,20 +940,23 @@ def run_ablation_study(task: str, config: Dict = None, use_resnet: bool = True):
     # Save results
     df = pd.DataFrame(results_log)
     os.makedirs(f'./ablation_{task}/results', exist_ok=True)
-    csv_path = f"./ablation_{task}/results/ablation_results_{task}_resnet{use_resnet}.csv"
+    csv_path = f"./ablation_{task}/results/ablation_results_{task}.csv"
     df.to_csv(csv_path, index=False)
     print(f"\n{'='*70}")
     print(f"✓ Results saved to: {csv_path}")
     print(f"{'='*70}\n")
     
+    # Print summary
     print("ABLATION SUMMARY:")
     print(df.to_string(index=False))
     
+    # Find best strategy
     best_idx = df['test2_acc'].idxmax()
     best_strategy = df.loc[best_idx, 'strategy']
     best_acc = df.loc[best_idx, 'test2_acc']
     print(f"\n🏆 BEST STRATEGY: {best_strategy} ({best_acc:.2f}%)")
     
+    # Plot modality contributions
     plot_modality_contributions(task, df)
     
     return df
@@ -955,7 +965,7 @@ def run_ablation_study(task: str, config: Dict = None, use_resnet: bool = True):
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description='Run fusion ablation study with ResNet + Transformer')
+    parser = argparse.ArgumentParser(description='Run fusion ablation study')
     parser.add_argument('--task', type=str, required=True,
                         choices=['SSVEP', 'P300', 'MI', 'Imagined_speech',
                                 'Lee2019_MI', 'Lee2019_SSVEP', 'BNCI2014_P300', 'BI2014b_P300'])
@@ -964,9 +974,8 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--seed', type=int, default=44)
     parser.add_argument('--patience', type=int, default=5)
-    parser.add_argument('--no_resnet', action='store_true', help='Disable ResNet blocks')
     
-    # STFT configuration
+    # STFT configuration (optional - uses task defaults if not specified)
     parser.add_argument('--stft_fs', type=int, default=None)
     parser.add_argument('--stft_nperseg', type=int, default=None)
     parser.add_argument('--stft_noverlap', type=int, default=None)
@@ -975,11 +984,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     config = {
+        # Training
         'num_epochs': args.epochs,
         'batch_size': args.batch_size,
         'lr': args.lr,
         'seed': args.seed,
         'patience': args.patience,
+        
+        # Model architecture
         'cnn_filters': 16,
         'lstm_hidden': 128,
         'pos_dim': 16,
@@ -989,6 +1001,7 @@ if __name__ == "__main__":
         'hidden_dim': 64,
     }
     
+    # Add STFT config if provided
     if args.stft_fs is not None:
         config['stft_fs'] = args.stft_fs
     if args.stft_nperseg is not None:
@@ -998,5 +1011,4 @@ if __name__ == "__main__":
     if args.stft_nfft is not None:
         config['stft_nfft'] = args.stft_nfft
     
-    use_resnet = not args.no_resnet
-    results = run_ablation_study(args.task, config, use_resnet=use_resnet)
+    results = run_ablation_study(args.task, config)
