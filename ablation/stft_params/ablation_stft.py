@@ -203,10 +203,10 @@ def get_stft_param_settings(task: str) -> List[Dict]:
     # Estimate typical input length based on task
     typical_input_lengths = {
         'SSVEP': 250,  # 250 Hz: 250 samples = 1 sec
-        'Lee2019_SSVEP': 1000,  # 1000 Hz: 1000 samples = 1 sec
+        'Lee2019_SSVEP': 250,
         'P300': 256,  # 256 Hz: 256 samples = 1 sec
         'BNCI2014_P300': 256,  # 256 Hz: Fixed - no resampling, use original 256 samples
-        'BI2014b_P300': 512,  # 512 Hz: 512 samples = 1 sec
+        'BI2014b_P300': 256,
         'MI': 1000,  # 250 Hz: 1000 samples = 4 sec
         'Lee2019_MI': 1000,  # 1000 Hz: 1000 samples = 1 sec
         'Imagined_speech': 1000,  # 1000 Hz: 1000 samples = 1 sec
