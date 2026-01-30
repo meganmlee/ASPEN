@@ -33,8 +33,8 @@ TASK_CONFIGS = {
         "num_seen": 27,
         "data_dir": "/ocean/projects/cis250213p/shared/ssvep",
         "sampling_rate": 250,
-        "stft_nperseg": 128,
-        "stft_noverlap": 64,
+        "stft_nperseg": 256,
+        "stft_noverlap": 128,
         "stft_nfft": 512,
     },
     "Lee2019_SSVEP": {
@@ -95,7 +95,7 @@ TASK_CONFIGS = {
         "sampling_rate": 250,
         "stft_nperseg": 64,
         "stft_noverlap": 48,
-        "stft_nfft": 1024,
+        "stft_nfft": 256,
     },
     "Imagined_speech": {
         "num_classes": 11,

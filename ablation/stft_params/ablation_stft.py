@@ -29,7 +29,7 @@ from tqdm import tqdm
 from torch.utils.data import WeightedRandomSampler
 
 # Add scale-net directory to path
-scale_net_path = os.path.join(os.path.dirname(__file__), '..', '..', 'scale-net')
+scale_net_path = os.path.join(os.path.dirname(__file__), '..', '..', 'scale_net')
 sys.path.insert(0, scale_net_path)
 
 # Import from scale-net
@@ -413,7 +413,20 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
     print(f"Estimated time: ~{estimated_hours:.1f} hours (assuming {epochs} epochs per config)")
     print(f"{'='*80}")
     
+    results_file = os.path.join(save_dir, f'{task.lower()}_stft_27_results.csv')
     results = []
+    completed_names = set()
+
+    if os.path.exists(results_file):
+        try:
+            existing_df = pd.read_csv(results_file)
+            results = existing_df.to_dict('records')
+            # Only consider it "complete" if there was no error
+            completed_names = {r['config_name'] for r in results if 'error' not in str(r.get('error', ''))}
+            print(f"Found existing results. Resuming from {len(completed_names)} completed configs.")
+        except Exception as e:
+            print(f"Could not load existing CSV, starting fresh. Error: {e}")
+
     best_acc = -1.0  # Changed to -1.0 to handle PR-AUC which can be 0-100
     best_config = None
     
@@ -427,6 +440,10 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
         nfft = stft_params['nfft']
         name = stft_params['name']
         overlap_ratio = stft_params['overlap_ratio']
+
+        if name in completed_names:
+            print(f"Skipping {name} (already completed).")
+            continue
         
         # Validate parameters BEFORE using them
         # Fix noverlap if it's >= nperseg (should not happen, but safety check)
@@ -631,6 +648,7 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
             }
             
             results.append(result)
+            pd.DataFrame(results).to_csv(results_file, index=False)
             
             # Track best configuration: Use PR-AUC for P300 tasks, val_acc for others
             if is_binary and task in ['P300', 'BNCI2014_P300', 'BI2014b_P300']:
@@ -692,10 +710,10 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
                 'nfft': nfft,
                 'error': str(e)
             })
+            pd.DataFrame(results).to_csv(results_file, index=False)
     
     # Save results
     results_df = pd.DataFrame(results)
-    results_file = os.path.join(save_dir, f'{task.lower()}_stft_27_results.csv')
     results_df.to_csv(results_file, index=False)
     print(f"\n✓ Results saved to: {results_file}")
     

@@ -24,7 +24,6 @@ from dataset import (
     create_dataloaders,
 )
 
-
 # ==================== SE Block ====================
 class SqueezeExcitation(nn.Module):
     """
@@ -85,77 +84,54 @@ class SpectralResidualBlock(nn.Module):
         return out
 
 
-class TransformerCrossFusion(nn.Module):
+class GlobalAttentionFusion(nn.Module):
     """
-    Dual-branch fusion combining:
-    1. Cross-Attention: Rich feature interaction between spectral and temporal
-    2. Global Weighting: Interpretable stream importance weights
-    
-    Returns both fused features and (B, 2) shaped weights for CSV compatibility
+    Trial-level global attention fusion.
+    Dynamically weights spectral and temporal streams per trial.
     """
-    def __init__(self, dim, num_heads=4, dropout=0.1, temperature=2.0):
+    def __init__(self, dim, temperature=2.0, dropout=0.1):
         super().__init__()
-        
-        # === Cross-Attention Branch ===
-        self.mha = nn.MultiheadAttention(
-            embed_dim=dim, 
-            num_heads=num_heads, 
-            batch_first=True,
-            dropout=dropout
-        )
-        
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, dim * 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim * 2, dim)
-        )
-        
-        self.dropout = nn.Dropout(dropout)
-        
-        # === Global Weighting Branch (for interpretability) ===
         self.temperature = temperature
-        self.global_attn = nn.Sequential(
+        
+        self.bn = nn.BatchNorm1d(dim)
+        
+        self.attn = nn.Sequential(
             nn.Linear(dim * 2, dim),
             nn.ReLU(),
-            nn.Dropout(dropout * 0.5),
+            nn.Dropout(dropout),
             nn.Linear(dim, 2)
         )
-
+        
+        self.alpha = nn.Parameter(torch.tensor(0.1))
+    
     def forward(self, x_s, x_t):
         """
         Args:
-            x_s: Spectral features (B, C, Dim)
-            x_t: Temporal features (B, C, Dim)
+            x_s: Spectral features (B, dim)
+            x_t: Temporal features (B, dim)
         
         Returns:
-            output: Fused features (B, C, Dim)
-            weights: Stream importance weights (B, 2) - [Spectral, Temporal]
+            fused: Fused features (B, dim)
+            weights: Attention weights (B, 2)
         """
-        # === 1. Cross-Attention Fusion ===
-        attn_out, _ = self.mha(query=x_s, key=x_t, value=x_t)
-        x_cross = self.norm1(x_s + self.dropout(attn_out))
-        x_fused = self.norm2(x_cross + self.dropout(self.ffn(x_cross)))
+        # Concatenate
+        ctx = torch.cat([x_s, x_t], dim=-1)  # (B, dim*2)
         
-        # === 2. Global Stream Weights (for interpretability) ===
-        ctx = torch.cat([
-            x_s.mean(dim=1),  # (B, Dim)
-            x_t.mean(dim=1)   # (B, Dim)
-        ], dim=-1)  # (B, Dim*2)
+        # Calculate attention weights
+        attn_logits = self.attn(ctx) / self.temperature
+        w = torch.softmax(attn_logits, dim=-1)  # (B, 2)
         
-        logits = self.global_attn(ctx) / self.temperature  # (B, 2)
-        w = torch.softmax(logits, dim=-1)  # (B, 2)
+        # Weighted combination
+        fused = w[:, 0:1] * x_s + w[:, 1:2] * x_t
         
-        # === 3. Combine with Global Weights ===
-        output = (
-            w[:, 0].view(-1, 1, 1) * x_fused +   # Weight for processed spectral
-            w[:, 1].view(-1, 1, 1) * x_t          # Weight for original temporal
-        )
+        # Add residual for stability
+        residual = (x_s + x_t) * 0.5
+        fused = fused + torch.sigmoid(self.alpha) * residual
         
-        return output, w  # w is (B, 2): [Spectral_Weight, Temporal_Weight]
+        # Batch normalize
+        fused = self.bn(fused)
+        
+        return fused, w
 
 
 class AdaptiveSCALENet(nn.Module):
@@ -175,12 +151,11 @@ class AdaptiveSCALENet(nn.Module):
                  n_classes,
                  T_raw,
                  cnn_filters=16,
-                 lstm_hidden=128,
-                 pos_dim=16,
+                 hidden_dim=128,
                  dropout=0.4,
                  cnn_dropout=0.25,
-                 use_hidden_layer=False,
-                 hidden_dim=64,
+                 use_hidden_layer=True,
+                 classifier_hidden_dim=64,
                  fusion_temperature=2.0):
         super().__init__()
         
@@ -218,7 +193,7 @@ class AdaptiveSCALENet(nn.Module):
         self.spec_out_dim = (freq_bins // 4) * (time_bins // 4) * self.spec_cnn_filters
         
         # ====== TEMPORAL STREAM (EEGNet Inspired) ======
-        F1 = 8   # F1 filters per temporal kernel
+        F1 = 16   # F1 filters per temporal kernel
         D = 2    # Depth multiplier (Spatial filters per temporal filter)
         F2 = F1 * D
         
@@ -237,60 +212,68 @@ class AdaptiveSCALENet(nn.Module):
             nn.Conv2d(F2, F2, (1, 1), bias=False),  # Pointwise
             nn.BatchNorm2d(F2),
             nn.ReLU(inplace=True),
-            nn.AvgPool2d((1, 8)),
+            nn.AvgPool2d((1, 4)),
+            nn.Dropout(cnn_dropout),
+
+            nn.Conv2d(F2, F2, (1, 8), padding=(0, 4), groups=F2, bias=False),
+            nn.Conv2d(F2, F2, (1, 1), bias=False),
+            nn.BatchNorm2d(F2),
+            nn.ReLU(inplace=True),
+            nn.AvgPool2d((1, 2)),
             nn.Dropout(cnn_dropout)
         )
         
         # Calculate temporal stream output dimension
-        final_time_dim = (T_raw // 4) // 8
-        self.time_out_dim = F2 * final_time_dim
+        self.time_out_dim = self._get_time_flattened_size(n_channels, T_raw)
         
-        # ====== FEATURE PROJECTION (for fusion) ======
+        # ====== FEATURE PROJECTION (to common dimension) ======
         self.proj_spec = nn.Sequential(
-            nn.Linear(self.spec_out_dim, lstm_hidden),
-            nn.Dropout(0.2)
+            nn.Linear(self.spec_out_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout * 0.5)
         )
         self.proj_time = nn.Sequential(
-            nn.Linear(self.time_out_dim, lstm_hidden),
-            nn.Dropout(0.2)
-        )
-
-        # Global Attention Fusion
-        self.fusion_layer = TransformerCrossFusion(
-            dim=lstm_hidden,
-            num_heads=4,
-            dropout=dropout,
-            temperature=fusion_temperature
+            nn.Linear(self.time_out_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout * 0.5)
         )
         
-        # Channel Position Embedding
-        self.chan_emb = nn.Embedding(n_channels, lstm_hidden)
-        
-        # LSTM
-        self.lstm = nn.LSTM(
-            input_size=lstm_hidden,
-            hidden_size=lstm_hidden,
-            batch_first=True,
-            bidirectional=False,
-            dropout=0
+        # ====== GLOBAL ATTENTION FUSION ======
+        self.fusion_layer = GlobalAttentionFusion(
+            dim=hidden_dim,
+            temperature=fusion_temperature,
+            dropout=dropout * 0.5
         )
-        self.dropout_lstm = nn.Dropout(dropout)
         
-        # Classifier
+        # ====== CLASSIFIER ======
         self.use_hidden_layer = use_hidden_layer
         if use_hidden_layer:
             self.hidden_layer = nn.Sequential(
-                nn.Linear(lstm_hidden, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.Linear(hidden_dim, classifier_hidden_dim),
                 nn.ReLU(inplace=True),
                 nn.Dropout(dropout)
             )
-            classifier_input = hidden_dim
+            classifier_input = classifier_hidden_dim
         else:
-            classifier_input = lstm_hidden
+            classifier_input = hidden_dim
         
         self.classifier = nn.Linear(classifier_input, 1 if n_classes == 2 else n_classes)
         
         self._init_weights()
+    
+    def _get_time_flattened_size(self, n_channels, T_raw):
+        with torch.no_grad():
+            # Create a dummy input
+            dummy_x = torch.zeros(1, 1, n_channels, T_raw)
+            # Pass through temporal layers
+            x = self.temp_conv(dummy_x)
+            x = self.bn_temp(x)
+            x = self.spatial_conv(x)
+            x = self.bn_spatial(x)
+            x = self.pool_spatial(F.relu(x))
+            x = self.separable_conv(x)
+            return x.numel() # This is your exact time_out_dim
 
     def _init_weights(self):
         for m in self.modules():
@@ -333,8 +316,9 @@ class AdaptiveSCALENet(nn.Module):
         # Stage 2: Pool
         x_s = self.spec_pool2(x_s)
         
-        # Project to common dimension
-        x_s = self.proj_spec(x_s.view(B, C, -1))
+        # Flatten and project: (B*C, features) -> (B, C, features) -> average over channels -> (B, hidden_dim)
+        x_s = x_s.view(B, C, -1)  # (B, C, flattened_features)
+        x_s = self.proj_spec(x_s).mean(dim=1)  # Average over channels: (B, hidden_dim)
         
         # 2. Temporal Stream
         x_t = self.separable_conv(
@@ -346,25 +330,16 @@ class AdaptiveSCALENet(nn.Module):
                 ))
             )
         )
-        x_t = self.proj_time(x_t.view(B, -1)).unsqueeze(1).expand(-1, C, -1)
+        x_t = self.proj_time(x_t.view(B, -1))  # (B, hidden_dim)
         
         # 3. Global Attention Fusion
-        features, weights = self.fusion_layer(x_s, x_t)
+        features, weights = self.fusion_layer(x_s, x_t)  # (B, hidden_dim), (B, 2)
         
-        # 4. Channel Position Embedding
-        if chan_ids is None:
-            chan_ids = torch.arange(C, device=features.device).unsqueeze(0).expand(B, C)
-        features = features + self.chan_emb(chan_ids)
-        
-        # 5. LSTM
-        _, (h, _) = self.lstm(features)
-        h = self.dropout_lstm(h.squeeze(0))
-        
-        # 6. Classifier
+        # 4. Classifier
         if self.use_hidden_layer:
-            h = self.hidden_layer(h)
+            features = self.hidden_layer(features)
         
-        return self.classifier(h), weights
+        return self.classifier(features), weights
 
 
 # ==================== Multi-GPU Setup ====================
@@ -551,11 +526,9 @@ def evaluate(model, loader, device, criterion=None, is_binary=False, return_metr
 
 
 # ==================== Attention Weight Collection ====================
-
 def collect_weights(model, loader, device):
     """
     Collects attention weights for every trial.
-    Works with dual-branch TransformerCrossFusion that returns (B, 2) weights.
     
     Returns:
         weights_array: Shape (N, 2) where N is number of trials
@@ -575,7 +548,7 @@ def collect_weights(model, loader, device):
             if weights is not None:
                 weights_np = weights.cpu().numpy()
                 
-                # Should be (B, 2) from dual-branch fusion
+                # Should be (B, 2)
                 if weights_np.ndim == 2 and weights_np.shape[1] == 2:
                     all_weights.append(weights_np)
                 else:
@@ -585,7 +558,6 @@ def collect_weights(model, loader, device):
         return None
     
     return np.concatenate(all_weights, axis=0)
-
 
 
 # ==================== Main Training ====================
@@ -611,14 +583,13 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
             'seed': 44,
             'n_classes': task_config.get('num_classes', 26),
             
-            # Model
-            'cnn_filters': 16,
-            'lstm_hidden': 128,
-            'pos_dim': 16,
-            'dropout': 0.4,
-            'cnn_dropout': 0.25,
-            'use_hidden_layer': False,
-            'hidden_dim': 64,
+            # Model - FIXED ACROSS ALL TASKS FOR GENERALIZABILITY
+            'cnn_filters': 24,  # Increased from 16 for better capacity
+            'hidden_dim': 256,  # Increased from 128 for better capacity
+            'dropout': 0.3,  # Slightly higher for regularization
+            'cnn_dropout': 0.25,  # Balanced regularization
+            'use_hidden_layer': True,
+            'classifier_hidden_dim': 128,  # Increased from 64
             'fusion_temperature': 2.0,
             
             # STFT - Use task-specific parameters
@@ -627,12 +598,12 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
             'stft_noverlap': task_config.get('stft_noverlap', 112),
             'stft_nfft': task_config.get('stft_nfft', 512),
             
-            # Training
+            # Training - FIXED ACROSS ALL TASKS
             'batch_size': 64,
             'num_epochs': 100,
-            'lr': 1e-3,
-            'weight_decay': 1e-4,
-            'patience': 20,
+            'lr': 3e-4,  # Conservative learning rate
+            'weight_decay': 5e-4,  # Stronger regularization
+            'patience': 15,
             'scheduler': 'ReduceLROnPlateau',
         }
     else:
@@ -642,12 +613,16 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
         config.setdefault('stft_nperseg', task_config.get('stft_nperseg', 128))
         config.setdefault('stft_noverlap', task_config.get('stft_noverlap', 112))
         config.setdefault('stft_nfft', task_config.get('stft_nfft', 512))
-        config.setdefault('dropout', 0.4)
+        config.setdefault('cnn_filters', 24)
+        config.setdefault('hidden_dim', 256)
+        config.setdefault('dropout', 0.3)
         config.setdefault('cnn_dropout', 0.25)
-        config.setdefault('use_hidden_layer', False)
-        config.setdefault('hidden_dim', 64)
+        config.setdefault('use_hidden_layer', True)
+        config.setdefault('classifier_hidden_dim', 128)
         config.setdefault('scheduler', 'ReduceLROnPlateau')
         config.setdefault('fusion_temperature', 2.0)
+        config.setdefault('lr', 3e-4)
+        config.setdefault('weight_decay', 5e-4)
     
     seed = config.get('seed', 44)
     seed_everything(seed, deterministic=True)
@@ -720,12 +695,11 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
         n_classes=n_classes,
         T_raw=T_raw,
         cnn_filters=config['cnn_filters'],
-        lstm_hidden=config['lstm_hidden'],
-        pos_dim=config['pos_dim'],
-        dropout=config.get('dropout', 0.4),
+        hidden_dim=config['hidden_dim'],
+        dropout=config.get('dropout', 0.3),
         cnn_dropout=config.get('cnn_dropout', 0.25),
-        use_hidden_layer=config.get('use_hidden_layer', False),
-        hidden_dim=config.get('hidden_dim', 64),
+        use_hidden_layer=config.get('use_hidden_layer', True),
+        classifier_hidden_dim=config.get('classifier_hidden_dim', 128),
         fusion_temperature=config.get('fusion_temperature', 2.0)
     ).to(device)
     
@@ -785,7 +759,7 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
     
     if model_path is None:
         seed = config.get('seed', 44)
-        model_path = f'best_{task.lower()}_model_{seed}.pth'
+        model_path = f'best_{task.lower()}_simplified_model_{seed}.pth'
     
     is_binary = (n_classes == 2)
     
@@ -861,7 +835,7 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
         results['test2_auc'] = test2_metrics.get('auc')
     
     print(f"\n{'='*70}")
-    print(f"FINAL RESULTS - {task}")
+    print(f"FINAL RESULTS - {task} (AdaptiveSCALENet Simplified)")
     print(f"{'='*70}")
     print(f"Best Val Acc: {best_val_acc:.2f}%")
     if results.get('val_f1') is not None:
@@ -910,16 +884,7 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
             )
             
             # Generate filename
-            if model_path:
-                base_name = os.path.basename(model_path)
-                if '_stft_' in base_name and '_model.pth' in base_name:
-                    config_part = base_name.split('_stft_')[1].replace('_model.pth', '')
-                    csv_filename = f'{task.lower()}_attention_weights_{config_part}_{weights_type}.csv'
-                else:
-                    csv_filename = f'{task.lower()}_attention_weights_{weights_type}.csv'
-            else:
-                csv_filename = f'{task.lower()}_attention_weights_{weights_type}.csv'
-            
+            csv_filename = f'{task.lower()}_attention_weights_simplified_{weights_type}.csv'
             weights_df.to_csv(csv_filename, index=False)
             
             # Print statistics
@@ -954,7 +919,7 @@ def train_all_tasks(tasks: Optional[list] = None, save_dir: str = './checkpoints
     all_results = {}
     
     print("=" * 80)
-    print("MULTI-TASK EEG CLASSIFICATION")
+    print("MULTI-TASK EEG CLASSIFICATION - AdaptiveSCALENet (Simplified)")
     print("=" * 80)
     
     for task in tasks:
@@ -963,7 +928,7 @@ def train_all_tasks(tasks: Optional[list] = None, save_dir: str = './checkpoints
         print(f"{'='*60}")
         
         try:
-            model_path = os.path.join(save_dir, f'best_{task.lower()}_model_44.pth')
+            model_path = os.path.join(save_dir, f'best_{task.lower()}_simplified_model_44.pth')
             model, results = train_task(task, model_path=model_path)
             all_results[task] = results
             
@@ -982,7 +947,7 @@ def train_all_tasks(tasks: Optional[list] = None, save_dir: str = './checkpoints
     
     # Summary
     print(f"\n{'='*80}")
-    print("SUMMARY RESULTS")
+    print("SUMMARY RESULTS - AdaptiveSCALENet (Simplified)")
     print(f"{'='*80}")
     
     for task, results in all_results.items():
@@ -1012,7 +977,7 @@ def train_model(config=None, model_path=None):
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description='Train AdaptiveSCALENet on EEG tasks')
+    parser = argparse.ArgumentParser(description='Train AdaptiveSCALENet (Simplified) on EEG tasks')
     parser.add_argument('--task', type=str, default='SSVEP',
                        choices=['SSVEP', 'P300', 'MI', 'Imagined_speech', 'Lee2019_MI', 'Lee2019_SSVEP', 'BNCI2014_P300', 'BI2014b_P300', 'all'],
                        help='Task to train on (default: SSVEP)')
@@ -1022,61 +987,39 @@ if __name__ == "__main__":
                        help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=64,
                        help='Batch size')
-    parser.add_argument('--lr', type=float, default=5e-4,
-                       help='Learning rate')
     parser.add_argument('--seed', type=int, default=44,
                        help='Random seed for reproducibility')
     parser.add_argument('--patience', type=int, default=15,
                        help='Early stopping patience')
-    
-    # STFT parameters (optional - uses task defaults if not specified)
-    parser.add_argument('--stft_fs', type=int, default=None,
-                       help='STFT sampling frequency (Hz). If not specified, uses task default.')
-    parser.add_argument('--stft_nperseg', type=int, default=None,
-                       help='STFT window length (nperseg). If not specified, uses task default.')
-    parser.add_argument('--stft_noverlap', type=int, default=None,
-                       help='STFT overlap length (noverlap). If not specified, uses task default.')
-    parser.add_argument('--stft_nfft', type=int, default=None,
-                       help='STFT FFT length (nfft). If not specified, uses task default.')
     parser.add_argument('--no_augment', action='store_true',
                        help='Disable train-time augmentation (default: augmentation ON).')
     
     args = parser.parse_args()
     
-    # Build config
+
     config = {
         'num_epochs': args.epochs,
         'batch_size': args.batch_size,
-        'lr': args.lr,
-        'cnn_filters': 16,
-        'lstm_hidden': 128,
-        'pos_dim': 16,
-        'dropout': 0.3,
-        'cnn_dropout': 0.2,
-        'use_hidden_layer': True,
-        'hidden_dim': 64,
-        'weight_decay': 1e-4,
-        'patience': args.patience,
-        'scheduler': 'ReduceLROnPlateau',
         'seed': args.seed,
+        'patience': args.patience,
+        
+        'cnn_filters': 24,
+        'hidden_dim': 256,
+        'dropout': 0.3,
+        'cnn_dropout': 0.25,
+        'use_hidden_layer': True,
+        'classifier_hidden_dim': 128,
+        'lr': 3e-4,
+        'weight_decay': 5e-4,
+        'scheduler': 'ReduceLROnPlateau',
         'fusion_temperature': 2.0,
-        'augment_train': (not args.no_augment)
+        'augment_train': (not args.no_augment),
     }
-    
-    # Add STFT config if provided (None values will use task defaults)
-    if args.stft_fs is not None:
-        config['stft_fs'] = args.stft_fs
-    if args.stft_nperseg is not None:
-        config['stft_nperseg'] = args.stft_nperseg
-    if args.stft_noverlap is not None:
-        config['stft_noverlap'] = args.stft_noverlap
-    if args.stft_nfft is not None:
-        config['stft_nfft'] = args.stft_nfft
     
     if args.task == 'all':
         results = train_all_tasks(save_dir=args.save_dir)
     else:
         seed = config.get('seed', 44)
-        model_path = os.path.join(args.save_dir, f'best_{args.task.lower()}_model_{seed}.pth')
+        model_path = os.path.join(args.save_dir, f'best_{args.task.lower()}_simplified_model_{seed}.pth')
         os.makedirs(args.save_dir, exist_ok=True)
         model, results = train_task(args.task, config=config, model_path=model_path)
