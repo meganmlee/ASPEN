@@ -62,10 +62,10 @@ TASK_CONFIGS = {
         "num_subjects": 10,
         "num_seen": 7,
         "data_dir": "/ocean/projects/cis250213p/shared/bnci2014_p300",
-        "sampling_rate": 512,
+        "sampling_rate": 256,
         "stft_nperseg": 256,
         "stft_noverlap": 192,
-        "stft_nfft": 1024,
+        "stft_nfft": 512,
     },
     "BI2014b_P300": {
         "num_classes": 2,
