@@ -188,182 +188,72 @@ def evaluate_with_metrics(model, loader, device, is_binary=False, threshold=0.5,
 # ==================== STFT 27-Config Generation ====================
 
 def get_stft_param_settings(task: str) -> List[Dict]:
-    """
-    Generate 27 STFT parameter settings for a given task
-    
-    Args:
-        task: Task name
-        
-    Returns:
-        List of 27 STFT parameter configurations to test
-    """
     task_config = TASK_CONFIGS.get(task, {})
-    sampling_rate = task_config.get('sampling_rate', 250)
-    
-    # Estimate typical input length based on task
-    typical_input_lengths = {
-        'SSVEP': 250,  # 250 Hz: 250 samples = 1 sec
-        'Lee2019_SSVEP': 250,
-        'P300': 256,  # 256 Hz: 256 samples = 1 sec
-        'BNCI2014_P300': 256,  # 256 Hz: Fixed - no resampling, use original 256 samples
-        'BI2014b_P300': 256,
-        'MI': 1000,  # 250 Hz: 1000 samples = 4 sec
-        'Lee2019_MI': 1000,  # 1000 Hz: 1000 samples = 1 sec
-        'Imagined_speech': 1000,  # 1000 Hz: 1000 samples = 1 sec
-    }
-    max_input_length = typical_input_lengths.get(task, 250)
-    
-    # Default parameters for this task
     default_nperseg = task_config.get('stft_nperseg', 128)
-    default_noverlap = task_config.get('stft_noverlap', 112)
     default_nfft = task_config.get('stft_nfft', 512)
     
-    # Define parameter ranges
-    if sampling_rate <= 256:
-        nperseg_candidates = [64, 128, 256]
-        if 512 <= max_input_length:
-            nperseg_candidates.append(512)
-    elif sampling_rate <= 512:
-        nperseg_candidates = [64, 128, 256, 512]
-        if 1024 <= max_input_length:
-            nperseg_candidates.append(1024)
-    else:  # 1000 Hz
-        nperseg_candidates = [256, 512, 1024]
-        if 2048 <= max_input_length:
-            nperseg_candidates.append(2048)
-    
-    # Filter by max_input_length and ensure default is included
-    nperseg_options = [n for n in nperseg_candidates if n <= max_input_length]
-    
-    # Ensure default_nperseg is included if it's valid
-    if default_nperseg <= max_input_length and default_nperseg not in nperseg_options:
-        nperseg_options.append(default_nperseg)
-        nperseg_options = sorted(nperseg_options)
-    
-    # Select 3 nperseg values: min, default (or closest), max
-    nperseg_values = []
-    if len(nperseg_options) == 1:
-        nperseg_values = nperseg_options
-    elif len(nperseg_options) == 2:
-        nperseg_values = nperseg_options
-    else:
-        # Always include default if possible, otherwise use middle value
-        min_val = min(nperseg_options)
-        max_val = max([n for n in nperseg_options if n <= max_input_length])
-        
-        if default_nperseg in nperseg_options:
-            mid_val = default_nperseg
-        else:
-            # Find closest to default
-            mid_val = min(nperseg_options, key=lambda x: abs(x - default_nperseg))
-        
-        nperseg_values = [min_val, mid_val, max_val]
-        # Remove duplicates and ensure exactly 3
-        nperseg_values = sorted(list(set(nperseg_values)))
-        if len(nperseg_values) > 3:
-            nperseg_values = [nperseg_values[0], nperseg_values[len(nperseg_values)//2], nperseg_values[-1]]
-        elif len(nperseg_values) < 3:
-            # Fill missing values
-            if len(nperseg_values) == 2:
-                # Add middle value
-                mid = (nperseg_values[0] + nperseg_values[1]) // 2
-                # Find closest in options
-                closest = min(nperseg_options, key=lambda x: abs(x - mid))
-                nperseg_values.insert(1, closest)
-                nperseg_values = sorted(list(set(nperseg_values)))
-    
-    # Select 3 overlap ratios: low (0.5), medium (0.75), high (0.9375)
-    overlap_values = [0.5, 0.75, 0.9375]
-    
-    # Select 3 nfft values: ensure all are >= max(nperseg_values) to guarantee 27 combinations
-    nfft_options = [256, 512, 1024, 2048]
-    max_nperseg = max(nperseg_values)
-    
-    # CRITICAL: Only select nfft values >= max_nperseg to ensure all combinations are valid
-    # This guarantees that for all nperseg values, all nfft values will be valid (nfft >= nperseg)
-    valid_nfft_options = [n for n in nfft_options if n >= max_nperseg]
-    
-    # If we don't have enough valid options (>= max_nperseg), we need to expand nfft_options
-    if len(valid_nfft_options) < 3:
-        # Try to find more options by checking larger values
-        larger_options = [n for n in [4096, 8192] if n >= max_nperseg]
-        valid_nfft_options.extend(larger_options)
-        valid_nfft_options = sorted(list(set(valid_nfft_options)))
-    
-    # Select 3 nfft values around default, but ensure they're all >= max_nperseg
-    nfft_values = []
-    if len(valid_nfft_options) >= 3:
-        # We have enough options >= max_nperseg
-        if default_nfft >= max_nperseg and default_nfft in valid_nfft_options:
-            # Default is valid, use it as center
-            default_idx = valid_nfft_options.index(default_nfft)
-            if default_idx == 0:
-                nfft_values = valid_nfft_options[:3]
-            elif default_idx == len(valid_nfft_options) - 1:
-                nfft_values = valid_nfft_options[-3:]
-            else:
-                start = max(0, default_idx - 1)
-                end = min(len(valid_nfft_options), start + 3)
-                nfft_values = valid_nfft_options[start:end]
-                if len(nfft_values) < 3:
-                    nfft_values = valid_nfft_options[:3]
-        else:
-            # Default not valid (too small), use first 3 valid options
-            nfft_values = valid_nfft_options[:3]
-    else:
-        # Not enough options >= max_nperseg, use what we have
-        nfft_values = valid_nfft_options
-    
-    # Ensure we have exactly 3 nfft values, all >= max_nperseg
-    if len(nfft_values) < 3:
-        # This should not happen if max_nperseg is reasonable, but handle it
-        # Try to use larger nfft values
-        min_needed = max_nperseg
-        larger_nfft = [n for n in nfft_options if n >= min_needed and n not in nfft_values]
-        nfft_values.extend(larger_nfft[:3 - len(nfft_values)])
-        nfft_values = sorted(nfft_values)
-        
-        # If still not enough, we have a problem - but try to proceed
-        if len(nfft_values) < 3:
-            print(f"WARNING: Only {len(nfft_values)} valid nfft values found for max_nperseg={max_nperseg}")
-            print(f"  This will result in fewer than 27 combinations!")
-    
-    # Generate all 3×3×3 = 27 settings
+    # 1. Define physical limits per task type (Total samples in one trial)
+    # These match your dataset trial lengths
+    trial_limits = {
+        'SSVEP': 512,
+        'P300': 256,
+        'MI': 1000,
+        'Imagined_speech': 1000,
+        'Lee2019_MI': 1000,
+        'Lee2019_SSVEP': 512,
+        'BNCI2014_P300': 256,
+        'BI2014b_P300': 256
+    }
+    # Fallback to the default nperseg if task not listed
+    max_allowed = trial_limits.get(task, default_nperseg)
+
+    # 2. Build Nperseg range: [Half, Default, Max-Possible]
+    # This ensures nperseg NEVER exceeds the trial length
+    nperseg_values = sorted(list(set([
+        max(32, default_nperseg // 2), 
+        default_nperseg, 
+        min(max_allowed, default_nperseg * 2) 
+    ])))
+
+    overlap_ratios = [0.5, 0.75, 0.9375]
     selected = []
+
     for nperseg in nperseg_values:
-        for overlap_ratio in overlap_values:
-            noverlap = int(nperseg * overlap_ratio)
-            # CRITICAL: Ensure noverlap < nperseg (strict inequality required by scipy)
-            if noverlap >= nperseg:
-                # Adjust to maximum valid value
-                noverlap = max(1, nperseg - 1)
-                # Recalculate actual overlap ratio
-                actual_overlap_ratio = noverlap / nperseg
-                print(f"WARNING: Generated noverlap ({int(nperseg * overlap_ratio)}) >= nperseg ({nperseg})")
-                print(f"  Adjusting to noverlap={noverlap}, actual overlap={actual_overlap_ratio*100:.1f}%")
-            else:
-                actual_overlap_ratio = overlap_ratio
+        # 3. Dynamic NFFT Pool
+        # Strategy: [Tightest power of 2, Task Default, High-Res]
+        pow2_min = 2**int(np.ceil(np.log2(nperseg)))
+        nfft_pool = sorted(list(set([pow2_min, 256, 512, 1024, 2048, default_nfft])))
+        
+        # Keep only NFFTs that are >= the current window size
+        valid_pool = [n for n in nfft_pool if n >= nperseg]
+        
+        # Center the 3-point NFFT ablation around your 'pretty good' default
+        if default_nfft in valid_pool:
+            idx = valid_pool.index(default_nfft)
+            start_idx = max(0, idx - 1)
+            nfft_candidates = valid_pool[start_idx : start_idx + 3]
+        else:
+            nfft_candidates = valid_pool[:3]
             
-            for nfft in nfft_values:
-                if nfft < nperseg:
-                    continue  # Skip invalid (nfft must be >= nperseg)
-                
+        while len(nfft_candidates) < 3:
+            nfft_candidates.append(nfft_candidates[-1] * 2)
+
+        for overlap_ratio in overlap_ratios:
+            noverlap = int(nperseg * overlap_ratio)
+            # Scipy Hard Constraint: noverlap MUST be < nperseg
+            if noverlap >= nperseg:
+                noverlap = nperseg - 1
+            
+            for nfft in nfft_candidates:
                 selected.append({
                     'nperseg': nperseg,
-                    'noverlap': noverlap,  # Use validated noverlap
+                    'noverlap': noverlap,
                     'nfft': nfft,
-                    'overlap_ratio': actual_overlap_ratio,  # Use actual overlap ratio
+                    'overlap_ratio': overlap_ratio,
+                    'name': f"nperseg{nperseg}_ov{int(overlap_ratio*100)}_nfft{nfft}"
                 })
-    
-    # Add names to configurations
-    for idx, cfg in enumerate(selected):
-        cfg['name'] = f"nperseg{cfg['nperseg']}_overlap{int(cfg['overlap_ratio']*100)}pct_nfft{cfg['nfft']}"
-    
-    print(f"Generated {len(selected)} settings (3×3×3 grid)")
-    
-    return selected
 
-
+    return selected[:27]
 # ==================== Ablation Study ====================
 
 def run_ablation(task: str, save_dir: str = './ablation_results',

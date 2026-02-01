@@ -9,7 +9,6 @@ Tests 7 different fusion strategies:
 5. multiplicative - Element-wise feature interaction
 6. bilinear - Low-rank bilinear interaction
 7. cross_attention - Multi-head cross-attention between streams
-
 """
 
 import torch
@@ -25,8 +24,10 @@ from sklearn.metrics import f1_score, recall_score, roc_auc_score, average_preci
 import matplotlib.pyplot as plt
 import seaborn as sns
 import mne
-
 # Import utilities
+scale_net_path = os.path.join(os.path.dirname(__file__), '..', '..', 'scale_net')
+sys.path.insert(0, scale_net_path)
+
 from seed_utils import seed_everything
 from dataset import load_dataset, TASK_CONFIGS, create_dataloaders
 
@@ -703,6 +704,10 @@ def evaluate_comprehensive(model, loader, device, is_binary=False):
 def collect_feature_statistics(model, loader, device, fusion_mode):
     """Collect fusion statistics and attention weights"""
     model.eval()
+    
+    # Unwrap DataParallel if needed
+    actual_model = unwrap_model(model)
+    
     stats = {
         'spec_contribution': [], 
         'time_contribution': [],
@@ -727,41 +732,41 @@ def collect_feature_statistics(model, loader, device, fusion_mode):
             # Get projected features manually to calculate contributions
             # Spectral stream with ResNet blocks
             x_spec_f = x_spec.view(B * C, 1, x_spec.size(2), x_spec.size(3))
-            x_spec_f = model.spec_conv1(x_spec_f)
-            x_spec_f = F.relu(model.spec_bn1(x_spec_f))
-            x_spec_f = model.spec_se1(x_spec_f)
-            x_spec_f = model.spec_dropout_cnn1(x_spec_f)
+            x_spec_f = actual_model.spec_conv1(x_spec_f)
+            x_spec_f = F.relu(actual_model.spec_bn1(x_spec_f))
+            x_spec_f = actual_model.spec_se1(x_spec_f)
+            x_spec_f = actual_model.spec_dropout_cnn1(x_spec_f)
             # ResNet blocks Stage 1
-            x_spec_f = model.spec_res1(x_spec_f)
-            x_spec_f = model.spec_res2(x_spec_f)
-            x_spec_f = model.spec_pool1(x_spec_f)
+            x_spec_f = actual_model.spec_res1(x_spec_f)
+            x_spec_f = actual_model.spec_res2(x_spec_f)
+            x_spec_f = actual_model.spec_pool1(x_spec_f)
             # Stage 2
-            x_spec_f = model.spec_conv2(x_spec_f)
-            x_spec_f = F.relu(model.spec_bn2(x_spec_f))
-            x_spec_f = model.spec_se2(x_spec_f)
-            x_spec_f = model.spec_dropout_cnn2(x_spec_f)
+            x_spec_f = actual_model.spec_conv2(x_spec_f)
+            x_spec_f = F.relu(actual_model.spec_bn2(x_spec_f))
+            x_spec_f = actual_model.spec_se2(x_spec_f)
+            x_spec_f = actual_model.spec_dropout_cnn2(x_spec_f)
             # ResNet blocks Stage 2
-            x_spec_f = model.spec_res3(x_spec_f)
-            x_spec_f = model.spec_res4(x_spec_f)
-            x_spec_f = model.spec_pool2(x_spec_f)
-            x_spec_proj = model.proj_spec(x_spec_f.view(B, C, -1))  # (B, C, hidden_dim)
+            x_spec_f = actual_model.spec_res3(x_spec_f)
+            x_spec_f = actual_model.spec_res4(x_spec_f)
+            x_spec_f = actual_model.spec_pool2(x_spec_f)
+            x_spec_proj = actual_model.proj_spec(x_spec_f.view(B, C, -1))  # (B, C, hidden_dim)
             x_spec_avg = x_spec_proj.mean(dim=1)  # (B, hidden_dim)
             
             # Temporal stream
             x_g = x_time.unsqueeze(1)
-            x_g = model.bn_temp(model.temp_conv(x_g))
-            x_g = model.pool_spatial(F.relu(model.bn_spatial(model.spatial_conv(x_g))))
-            x_g = model.separable_conv(x_g)
-            x_time_proj = model.proj_time(x_g.view(B, -1))  # (B, hidden_dim)
+            x_g = actual_model.bn_temp(actual_model.temp_conv(x_g))
+            x_g = actual_model.pool_spatial(F.relu(actual_model.bn_spatial(actual_model.spatial_conv(x_g))))
+            x_g = actual_model.separable_conv(x_g)
+            x_time_proj = actual_model.proj_time(x_g.view(B, -1))  # (B, hidden_dim)
             
             # Get fusion weights
             if fusion_mode == 'spatial_attention':
-                _, weights = model.fusion_layer(x_spec_avg, x_time_proj, x_spec_proj)
+                _, weights = actual_model.fusion_layer(x_spec_avg, x_time_proj, x_spec_proj)
                 if weights is not None:
                     # weights shape is (B, C, 2) - take spectral weights
                     stats['spatial_weights'].append(weights[:, :, 0].cpu().numpy())
             else:
-                _, weights = model.fusion_layer(x_spec_avg, x_time_proj)
+                _, weights = actual_model.fusion_layer(x_spec_avg, x_time_proj)
             
             if fusion_mode in ['global_attention', 'cross_attention'] and weights is not None:
                 # weights shape is (B, 2) - [Spectral, Temporal]
@@ -1030,6 +1035,11 @@ def run_ablation_study(task: str, config: Dict = None):
     print(f"Testing {len(strategies)} fusion strategies")
     print(f"Architecture: AdaptiveSCALENet (matching scale_net_adaptive_v2.py)")
     print(f"{'='*70}\n")
+
+    print("STFT Configuration:")
+    for k, v in config.items():
+        if k.startswith('stft_'):
+            print(f"  {k}: {v}")
     
     results_log = []
     
