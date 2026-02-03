@@ -83,56 +83,20 @@ class SpectralResidualBlock(nn.Module):
         
         return out
 
-
-class GlobalAttentionFusion(nn.Module):
-    """
-    Trial-level global attention fusion.
-    Dynamically weights spectral and temporal streams per trial.
-    """
-    def __init__(self, dim, temperature=2.0, dropout=0.1):
+class MultiplicativeFusion(nn.Module):
+    """Element-wise multiplicative feature interaction"""
+    def __init__(self, dim, dropout=0.1, **kwargs):
         super().__init__()
-        self.temperature = temperature
-        
+        self.proj_s = nn.Linear(dim, dim)
+        self.proj_t = nn.Linear(dim, dim)
         self.bn = nn.BatchNorm1d(dim)
-        
-        self.attn = nn.Sequential(
-            nn.Linear(dim * 2, dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim, 2)
-        )
-        
-        self.alpha = nn.Parameter(torch.tensor(0.1))
+        self.dropout = nn.Dropout(dropout)
     
     def forward(self, x_s, x_t):
-        """
-        Args:
-            x_s: Spectral features (B, dim)
-            x_t: Temporal features (B, dim)
-        
-        Returns:
-            fused: Fused features (B, dim)
-            weights: Attention weights (B, 2)
-        """
-        # Concatenate
-        ctx = torch.cat([x_s, x_t], dim=-1)  # (B, dim*2)
-        
-        # Calculate attention weights
-        attn_logits = self.attn(ctx) / self.temperature
-        w = torch.softmax(attn_logits, dim=-1)  # (B, 2)
-        
-        # Weighted combination
-        fused = w[:, 0:1] * x_s + w[:, 1:2] * x_t
-        
-        # Add residual for stability
-        residual = (x_s + x_t) * 0.5
-        fused = fused + torch.sigmoid(self.alpha) * residual
-        
-        # Batch normalize
+        fused = self.proj_s(x_s) * self.proj_t(x_t)
+        fused = self.dropout(fused)
         fused = self.bn(fused)
-        
-        return fused, w
-
+        return fused, None
 
 class AdaptiveSCALENet(nn.Module):
     """
@@ -238,10 +202,9 @@ class AdaptiveSCALENet(nn.Module):
             nn.Dropout(dropout * 0.5)
         )
         
-        # ====== GLOBAL ATTENTION FUSION ======
-        self.fusion_layer = GlobalAttentionFusion(
+        # ====== Multiplicative FUSION ======
+        self.fusion_layer = MultiplicativeFusion(
             dim=hidden_dim,
-            temperature=fusion_temperature,
             dropout=dropout * 0.5
         )
         
@@ -525,39 +488,182 @@ def evaluate(model, loader, device, criterion=None, is_binary=False, return_metr
     return avg_loss, acc, metrics
 
 
-# ==================== Attention Weight Collection ====================
-def collect_weights(model, loader, device):
+# ==================== Multiplicative stats Collection ====================
+def collect_fusion_stats(model, loader, device) -> Optional[Dict[str, np.ndarray]]:
     """
-    Collects attention weights for every trial.
+    Collects feature statistics for multiplicative fusion analysis.
+    
+    For multiplicative fusion: fused = proj_s(x_s) * proj_t(x_t)
+    
+    We analyze:
+    1. Feature magnitudes (L2 norms) of each stream's projected features
+    2. Mean activations per stream
+    3. Contribution ratio: |proj_s| / (|proj_s| + |proj_t|)
     
     Returns:
-        weights_array: Shape (N, 2) where N is number of trials
-                      Column 0: Spectral weight
-                      Column 1: Temporal weight
+        Dictionary containing:
+        - 'spectral_magnitude': L2 norm of projected spectral features (N,)
+        - 'temporal_magnitude': L2 norm of projected temporal features (N,)
+        - 'spectral_contribution': Relative contribution ratio (N,)
+        - 'spectral_mean_activation': Mean activation of spectral features (N,)
+        - 'temporal_mean_activation': Mean activation of temporal features (N,)
+        - 'feature_correlation': Correlation between streams per trial (N,)
     """
     model.eval()
-    all_weights = []
     
-    with torch.no_grad():
-        for inputs, _ in tqdm(loader, desc='Collecting Weights', ncols=100):
-            x_time, x_spec = inputs
-            x_time, x_spec = x_time.to(device), x_spec.to(device)
-            
-            _, weights = model(x_time, x_spec)
-            
-            if weights is not None:
-                weights_np = weights.cpu().numpy()
+    # Storage for statistics
+    spectral_magnitudes = []
+    temporal_magnitudes = []
+    spectral_mean_acts = []
+    temporal_mean_acts = []
+    feature_correlations = []
+    
+    # Get the actual model (unwrap DataParallel if needed)
+    actual_model = model.module if hasattr(model, 'module') else model
+    
+    # Register hooks to capture intermediate features
+    spectral_features = []
+    temporal_features = []
+    
+    def hook_spectral(module, input, output):
+        # Move to CPU immediately to avoid GPU device conflicts
+        spectral_features.append(output.detach().cpu())
+    
+    def hook_temporal(module, input, output):
+        # Move to CPU immediately to avoid GPU device conflicts
+        temporal_features.append(output.detach().cpu())
+    
+    # Register hooks on projection layers
+    hook_s = actual_model.proj_spec.register_forward_hook(hook_spectral)
+    hook_t = actual_model.proj_time.register_forward_hook(hook_temporal)
+    
+    try:
+        with torch.no_grad():
+            for inputs, _ in tqdm(loader, desc='Collecting Fusion Stats', ncols=100):
+                x_time, x_spec = inputs
+                x_time, x_spec = x_time.to(device), x_spec.to(device)
                 
-                # Should be (B, 2)
-                if weights_np.ndim == 2 and weights_np.shape[1] == 2:
-                    all_weights.append(weights_np)
-                else:
-                    print(f"Warning: Unexpected weight shape {weights_np.shape}, expected (B, 2)")
+                # Clear feature lists
+                spectral_features.clear()
+                temporal_features.clear()
+                
+                # Forward pass (hooks will capture features)
+                _ = model(x_time, x_spec)
+                
+                if spectral_features and temporal_features:
+                    # With DataParallel, hooks may be called multiple times (once per GPU)
+                    # Concatenate all chunks along batch dimension
+                    if len(spectral_features) > 1:
+                        x_s = torch.cat(spectral_features, dim=0)
+                        x_t = torch.cat(temporal_features, dim=0)
+                    else:
+                        x_s = spectral_features[0]
+                        x_t = temporal_features[0]
+                    
+                    # Features are already on CPU from hooks
+                    
+                    # Handle case where spectral still has channel dimension
+                    if x_s.dim() == 3:
+                        x_s = x_s.mean(dim=1)  # Average over channels
+                    
+                    # 1. L2 magnitudes
+                    spec_mag = torch.norm(x_s, p=2, dim=-1)  # (B,)
+                    temp_mag = torch.norm(x_t, p=2, dim=-1)  # (B,)
+                    
+                    spectral_magnitudes.append(spec_mag.numpy())
+                    temporal_magnitudes.append(temp_mag.numpy())
+                    
+                    # 2. Mean activations
+                    spec_mean = x_s.mean(dim=-1)  # (B,)
+                    temp_mean = x_t.mean(dim=-1)  # (B,)
+                    
+                    spectral_mean_acts.append(spec_mean.numpy())
+                    temporal_mean_acts.append(temp_mean.numpy())
+                    
+                    # 3. Feature correlation per trial
+                    # Normalize features for correlation
+                    x_s_norm = F.normalize(x_s, p=2, dim=-1)
+                    x_t_norm = F.normalize(x_t, p=2, dim=-1)
+                    correlation = (x_s_norm * x_t_norm).sum(dim=-1)  # Cosine similarity
+                    
+                    feature_correlations.append(correlation.numpy())
     
-    if len(all_weights) == 0:
+    finally:
+        # Remove hooks
+        hook_s.remove()
+        hook_t.remove()
+    
+    if not spectral_magnitudes:
         return None
     
-    return np.concatenate(all_weights, axis=0)
+    # Concatenate all batches
+    spectral_magnitudes = np.concatenate(spectral_magnitudes)
+    temporal_magnitudes = np.concatenate(temporal_magnitudes)
+    spectral_mean_acts = np.concatenate(spectral_mean_acts)
+    temporal_mean_acts = np.concatenate(temporal_mean_acts)
+    feature_correlations = np.concatenate(feature_correlations)
+    
+    # Calculate contribution ratio: spectral / (spectral + temporal)
+    total_magnitude = spectral_magnitudes + temporal_magnitudes + 1e-8
+    spectral_contribution = spectral_magnitudes / total_magnitude
+    
+    return {
+        'spectral_magnitude': spectral_magnitudes,
+        'temporal_magnitude': temporal_magnitudes,
+        'spectral_contribution': spectral_contribution,
+        'temporal_contribution': 1 - spectral_contribution,
+        'spectral_mean_activation': spectral_mean_acts,
+        'temporal_mean_activation': temporal_mean_acts,
+        'feature_correlation': feature_correlations,
+    }
+
+
+def save_fusion_stats(stats: Dict[str, np.ndarray], task: str, split: str = 'test') -> str:
+    """
+    Save fusion statistics to CSV file.
+    
+    Args:
+        stats: Dictionary from collect_fusion_stats
+        task: Task name (e.g., 'SSVEP', 'P300')
+        split: Data split name (e.g., 'test', 'val', 'unseen')
+    
+    Returns:
+        Filename of saved CSV
+    """
+    df = pd.DataFrame({
+        'Spectral_Magnitude': stats['spectral_magnitude'],
+        'Temporal_Magnitude': stats['temporal_magnitude'],
+        'Spectral_Contribution': stats['spectral_contribution'],
+        'Temporal_Contribution': stats['temporal_contribution'],
+        'Spectral_Mean_Activation': stats['spectral_mean_activation'],
+        'Temporal_Mean_Activation': stats['temporal_mean_activation'],
+        'Feature_Correlation': stats['feature_correlation'],
+    })
+    
+    filename = f'{task.lower()}_fusion_stats_{split}.csv'
+    df.to_csv(filename, index=False)
+    
+    return filename
+
+
+def print_fusion_summary(stats: Dict[str, np.ndarray], task: str):
+    """Print summary statistics for fusion analysis."""
+    print(f"\n{'='*60}")
+    print(f"Fusion Statistics Summary - {task}")
+    print(f"{'='*60}")
+    print(f"Number of trials: {len(stats['spectral_magnitude'])}")
+    print(f"\nFeature Magnitudes (L2 Norm):")
+    print(f"  Spectral: {stats['spectral_magnitude'].mean():.4f} ± {stats['spectral_magnitude'].std():.4f}")
+    print(f"  Temporal: {stats['temporal_magnitude'].mean():.4f} ± {stats['temporal_magnitude'].std():.4f}")
+    print(f"\nRelative Contributions:")
+    print(f"  Spectral: {stats['spectral_contribution'].mean()*100:.1f}% ± {stats['spectral_contribution'].std()*100:.1f}%")
+    print(f"  Temporal: {stats['temporal_contribution'].mean()*100:.1f}% ± {stats['temporal_contribution'].std()*100:.1f}%")
+    print(f"\nMean Activations:")
+    print(f"  Spectral: {stats['spectral_mean_activation'].mean():.4f} ± {stats['spectral_mean_activation'].std():.4f}")
+    print(f"  Temporal: {stats['temporal_mean_activation'].mean():.4f} ± {stats['temporal_mean_activation'].std():.4f}")
+    print(f"\nFeature Correlation (Cosine Similarity):")
+    print(f"  Mean: {stats['feature_correlation'].mean():.4f} ± {stats['feature_correlation'].std():.4f}")
+    print(f"{'='*60}")
 
 
 # ==================== Main Training ====================
@@ -634,7 +740,7 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
     print(f"{task} Classification")
     print(f"{'='*70}")
     print(f"Device: {device}, GPUs: {n_gpus}")
-    print(f"Fusion: Global Attention (temperature={config.get('fusion_temperature', 2.0)})")
+    print(f"Fusion: Multiplicative")
     
     # ====== Load Data ======
     datasets = load_dataset(
@@ -863,38 +969,23 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
     print(f"{'='*70}")
     
     # ====== Collect and Save Attention Weights ======
-    print(f"\n{'='*70}")
-    print(f"Collecting attention weights for {task}...")
+    print(f"Collecting fusion statistics for {task}...")
     
-    weights_loader = test2_loader if test2_loader else val_loader
-    weights_type = 'unseen' if test2_loader else 'val'
+    stats_loader = test2_loader if test2_loader else val_loader
+    stats_type = 'unseen' if test2_loader else 'val'
     
-    if weights_loader:
-        all_weights_array = collect_weights(model, weights_loader, device)
+    if stats_loader:
+        fusion_stats = collect_fusion_stats(model, stats_loader, device)
         
-        if all_weights_array is not None and len(all_weights_array) > 0:
-            # Ensure 2D shape (N, 2)
-            if all_weights_array.ndim == 3:
-                all_weights_array = all_weights_array.mean(axis=1)
+        if fusion_stats is not None:
+            # Print summary
+            print_fusion_summary(fusion_stats, task)
             
-            # Convert to DataFrame and save
-            weights_df = pd.DataFrame(
-                all_weights_array,
-                columns=['Spectral_Weight', 'Temporal_Weight']
-            )
-            
-            # Generate filename
-            csv_filename = f'{task.lower()}_attention_weights_simplified_{weights_type}.csv'
-            weights_df.to_csv(csv_filename, index=False)
-            
-            # Print statistics
-            mean_spec = weights_df['Spectral_Weight'].mean()
-            mean_time = weights_df['Temporal_Weight'].mean()
-            print(f"✓ Attention weights (N={len(weights_df)}) saved to: {csv_filename}")
-            print(f"  Mean Spectral Weight: {mean_spec:.4f}")
-            print(f"  Mean Temporal Weight: {mean_time:.4f}")
+            # Save to CSV
+            csv_filename = save_fusion_stats(fusion_stats, task, stats_type)
+            print(f"Fusion statistics saved to: {csv_filename}")
         else:
-            print(f"⚠ No attention weights collected")
+            print(f"No fusion statistics collected")
     
     print(f"{'='*70}")
     
