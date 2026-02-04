@@ -33,9 +33,9 @@ TASK_CONFIGS = {
         "num_seen": 27,
         "data_dir": "/ocean/projects/cis250213p/shared/ssvep",
         "sampling_rate": 250,
-        "stft_nperseg": 128,
-        "stft_noverlap": 112,
-        "stft_nfft": 512,
+        "stft_nperseg": 256,
+        "stft_noverlap": 128,
+        "stft_nfft": 256,
     },
     "Lee2019_SSVEP": {
         "num_classes": 4,
@@ -43,9 +43,9 @@ TASK_CONFIGS = {
         "num_seen": 40,
         "data_dir": "/ocean/projects/cis250213p/shared/lee2019_ssvep_processed",
         "sampling_rate": 250,
-        "stft_nperseg": 128,
-        "stft_noverlap": 112,
-        "stft_nfft": 512,
+        "stft_nperseg": 256,
+        "stft_noverlap": 128,
+        "stft_nfft": 1024,
     },
     "P300": {
         "num_classes": 2,
@@ -62,20 +62,20 @@ TASK_CONFIGS = {
         "num_subjects": 10,
         "num_seen": 7,
         "data_dir": "/ocean/projects/cis250213p/shared/bnci2014_p300",
-        "sampling_rate": 256,  # Fixed: Original data is 256Hz, no resampling
-        "stft_nperseg": 256,
-        "stft_noverlap": 240,
-        "stft_nfft": 512,
+        "sampling_rate": 256,
+        "stft_nperseg": 128,
+        "stft_noverlap": 120,
+        "stft_nfft": 256,
     },
     "BI2014b_P300": {
         "num_classes": 2,
         "num_subjects": 38,
         "num_seen": 30,
         "data_dir": "/ocean/projects/cis250213p/shared/bi2014b_processed",
-        "sampling_rate": 512,
-        "stft_nperseg": 64,
-        "stft_noverlap": 56,
-        "stft_nfft": 256,
+        "sampling_rate": 256,
+        "stft_nperseg": 32,
+        "stft_noverlap": 16,
+        "stft_nfft": 512,
     },
     "MI": {
         "num_classes": 4,
@@ -83,8 +83,8 @@ TASK_CONFIGS = {
         "num_seen": 7,
         "data_dir": "/ocean/projects/cis250213p/shared/mi",
         "sampling_rate": 250,
-        "stft_nperseg": 128,
-        "stft_noverlap": 112,
+        "stft_nperseg": 512,
+        "stft_noverlap": 256,
         "stft_nfft": 512,
     },
     "Lee2019_MI": {
@@ -93,9 +93,9 @@ TASK_CONFIGS = {
         "num_seen": 40,
         "data_dir": "/ocean/projects/cis250213p/shared/lee2019_mi_processed",
         "sampling_rate": 250,
-        "stft_nperseg": 128,
-        "stft_noverlap": 112,
-        "stft_nfft": 512,
+        "stft_nperseg": 32,
+        "stft_noverlap": 30,
+        "stft_nfft": 32,
     },
     "Imagined_speech": {
         "num_classes": 11,
@@ -1120,7 +1120,8 @@ def get_stft_dimensions(data_sample: np.ndarray, stft_config: Dict) -> Tuple[int
 
 
 def create_dataloaders(datasets: Dict, stft_config: Dict, batch_size: int = 32, 
-                       num_workers: int = 4, augment_train: bool = True, seed: int = 44) -> Dict:
+                       num_workers: int = 4, augment_train: bool = True, seed: int = 44,
+                       train_sampler=None) -> Dict:
     """
     Create DataLoaders for all splits
     
@@ -1131,6 +1132,7 @@ def create_dataloaders(datasets: Dict, stft_config: Dict, batch_size: int = 32,
         num_workers: Number of workers for DataLoader
         augment_train: Whether to augment training data
         seed: seed for shuffling
+        train_sampler: Optional sampler for training set (if provided, shuffle is ignored for train)
         
     Returns:
         Dictionary of DataLoaders
@@ -1142,18 +1144,31 @@ def create_dataloaders(datasets: Dict, stft_config: Dict, batch_size: int = 32,
     
     for split, (X, y) in datasets.items():
         augment = augment_train if split == 'train' else False
-        shuffle = (split == 'train')
+        shuffle = (split == 'train') and (train_sampler is None)
         
         ds = EEGDataset(X, y, stft_config, normalize=True, augment=augment)
-        loaders[split] = DataLoader(
-            ds, 
-            batch_size=batch_size, 
-            shuffle=shuffle,
-            num_workers=num_workers, 
-            pin_memory=True,
-            worker_init_fn=lambda worker_id: worker_init_fn(worker_id, seed),
-            generator=get_generator(seed) if shuffle else None
-        )
+        
+        # Use sampler for train if provided, otherwise use shuffle
+        if split == 'train' and train_sampler is not None:
+            loaders[split] = DataLoader(
+                ds, 
+                batch_size=batch_size,
+                sampler=train_sampler,
+                num_workers=num_workers, 
+                pin_memory=True,
+                worker_init_fn=lambda worker_id: worker_init_fn(worker_id, seed),
+                generator=get_generator(seed)
+            )
+        else:
+            loaders[split] = DataLoader(
+                ds, 
+                batch_size=batch_size, 
+                shuffle=shuffle,
+                num_workers=num_workers, 
+                pin_memory=True,
+                worker_init_fn=lambda worker_id: worker_init_fn(worker_id, seed),
+                generator=get_generator(seed) if shuffle else None
+            )
     
     return loaders
 
