@@ -1,28 +1,42 @@
-# SCALE-Net for Cross-Subject EEG Generalization
-This framework, Spectral Convolutional Attention (SE) LSTM Encoder (SCALE-Net), aims to improve the cross subject generalization in EEG signals. This project was part of the CMU Introduction to Deep Learning course. 
+# ASPEN: Spectral-Temporal Fusion for Cross-Subject Brain Decoding
+This framework, Adaptive SPectral Encoder Network (ASPEN), aims to improve the cross subject generalization in EEG signals.
 
-## SCALE-Net
+## Data Preprocessing
+The data used in our analysis and benchmarking was from [MOABB](https://moabb.neurotechx.com/docs/dataset_summary.html).
 
-To train (options for task name are SSVEP, P300, MI, Imagined_speech, and all):
+After downloading the datafiles, to preprocess the data:
 
-      cd scale-net
-      python -m train_scale_net —task [task name]
+      cd data_process
+      python preprocess_data.py
+
+## ASPEN
+To train (options for task name are 'SSVEP', 'Lee2019_SSVEP', 'BI2014b_P300', 'BNCI2014_P300', 'MI', 'Lee2019_MI'):
+
+      cd model
+      python -m train_aspen —task [task name]
+
+## SPEN (SPectral Encoder Network) 
+SPEN is only the spectral stream of the network. This doesn't incorporate the temporal signals.
+
+To train (options for task name are 'SSVEP', 'Lee2019_SSVEP', 'BI2014b_P300', 'BNCI2014_P300', 'MI', 'Lee2019_MI'):
+
+      cd model
+      python -m train_spen —task [task name]
       
-To test (options for task name are SSVEP, P300, MI, Imagined_speech, and all):
+To test (options for task name are 'SSVEP', 'Lee2019_SSVEP', 'BI2014b_P300', 'BNCI2014_P300', 'MI', 'Lee2019_MI'):
 
-      python -m test_scale_net —task [task name]
-
-## SCALE-Net + EEGNet
-This version uses temporal and spectral data. Features are added together in a balanced manner.
-
-To train (options for task name are SSVEP, P300, MI, Imagined_speech, and all):
-
-      python -m train_scalenet_eegnet —task [task name]
+      python -m test_spen —task [task name]
       
-## Adaptive SCALE-Net
-This is our most accurate model. It uses temporal and spectral data with weighted featuring.
+## Acknowledgements
+This work was done as a part of the CMU 11-785: Introduction to Deep Learning course.
 
-To train (options for task name are SSVEP, P300, MI, Imagined_speech, and all):
+## References
 
-      python -m scale_net_adaptive —task [task name]
-      
+### Baselines
+- [EEGNet](https://github.com/amrzhd/EEGNet/)  
+- [EEGConformer](https://github.com/eeyhsong/EEG-Conformer)
+- [TSformer-SA](https://github.com/lixujin99/TSformer-SA) 
+- [MultiDiffNet](https://github.com/eddieguo-1128/DualDiff)
+- [CTNet](https://github.com/snailpt/CTNet)
+### Datasets
+- [MOABB](https://moabb.neurotechx.com/docs/dataset_summary.html)

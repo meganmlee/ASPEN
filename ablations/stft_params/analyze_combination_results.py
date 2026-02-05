@@ -19,9 +19,9 @@ import pandas as pd
 import torch
 from datetime import datetime
 
-# Add scale-net directory to path
-scale_net_path = os.path.join(os.path.dirname(__file__), '..', '..', 'scale-net')
-sys.path.insert(0, scale_net_path)
+# Add model directory to path
+model_path = os.path.join(os.path.dirname(__file__), '..', '..', 'model')
+sys.path.insert(0, model_path)
 
 from dataset import TASK_CONFIGS
 
@@ -118,8 +118,8 @@ def evaluate_model_from_checkpoint(checkpoint_path: str, task: str) -> Optional[
     """
     try:
         # Import here to avoid circular imports
-        sys.path.insert(0, scale_net_path)
-        from train_scale_net import SCALENet, evaluate
+        sys.path.insert(0, model_path)
+        from train_spen import SPEN, evaluate
         from dataset import load_dataset, create_dataloaders
         import torch.nn as nn
         
@@ -170,7 +170,7 @@ def evaluate_model_from_checkpoint(checkpoint_path: str, task: str) -> Optional[
         
         # Get model dimensions
         sample_x, _ = next(iter(loaders['val']))
-        # For regular scale_net, inputs is a list [x_time, x_spec], use spectral only
+        # For regular SPEN, inputs is a list [x_time, x_spec], use spectral only
         if isinstance(sample_x, list):
             sample_x_spec = sample_x[1]
         else:
@@ -181,7 +181,7 @@ def evaluate_model_from_checkpoint(checkpoint_path: str, task: str) -> Optional[
         n_classes = config.get('n_classes', task_config.get('num_classes', 26))
         is_binary = (n_classes == 2)
         
-        model = SCALENet(
+        model = SPEN(
             freq_bins=freq_bins,
             time_bins=time_bins,
             n_channels=n_channels,

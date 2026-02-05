@@ -13,9 +13,9 @@ import os
 import sys
 import pandas as pd
 
-# Import from scale_net_adaptive
-from scale_net_adaptive import (
-    AdaptiveSCALENet,
+# Import from ASPEN
+from train_aspen import (
+    ASPEN,
     evaluate,
     unwrap_model,
     setup_device,
@@ -107,7 +107,7 @@ def load_model_from_checkpoint(checkpoint_path, device):
     
     # Create model
     n_classes = config.get('n_classes', task_config.get('num_classes', 26))
-    model = AdaptiveSCALENet(
+    model = ASPEN(
         freq_bins=freq_bins,
         time_bins=time_bins,
         n_channels=n_channels,

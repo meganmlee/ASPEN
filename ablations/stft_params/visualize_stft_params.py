@@ -18,11 +18,11 @@ matplotlib.use('Agg')  # Non-interactive backend
 import argparse
 from typing import Dict, List, Tuple
 
-# Add scale-net directory to path
-scale_net_path = os.path.join(os.path.dirname(__file__), '..', '..', 'scale-net')
-sys.path.insert(0, scale_net_path)
+# Add model directory to path
+model_path = os.path.join(os.path.dirname(__file__), '..', '..', 'model')
+sys.path.insert(0, model_path)
 
-# Import from scale-net
+# Import from model
 from dataset import TASK_CONFIGS, load_dataset, apply_stft_transform
 from ablation_stft import get_stft_param_grid
 

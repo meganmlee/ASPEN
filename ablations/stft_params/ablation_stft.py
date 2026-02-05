@@ -1,5 +1,5 @@
 """
-STFT 27-Config Ablation Study for Adaptive SCALE-Net
+STFT 27-Config Ablation Study for ASPEN
 
 This script performs systematic ablation study by testing 27 settings
 of STFT parameters (nperseg, noverlap, nfft) to find optimal configurations.
@@ -28,12 +28,12 @@ from sklearn.metrics import f1_score, recall_score, roc_auc_score, average_preci
 from tqdm import tqdm
 from torch.utils.data import WeightedRandomSampler
 
-# Add scale-net directory to path
-scale_net_path = os.path.join(os.path.dirname(__file__), '..', '..', 'scale_net')
-sys.path.insert(0, scale_net_path)
+# Add model directory to path
+model_path = os.path.join(os.path.dirname(__file__), '..', '..', 'model')
+sys.path.insert(0, model_path)
 
-# Import from scale-net
-from train_scale_net_v2 import train_task, SCALENet
+# Import from SPEN
+from train_spen import train_task, SPEN
 from dataset import TASK_CONFIGS, load_dataset, create_dataloaders
 
 
@@ -117,7 +117,7 @@ def evaluate_with_metrics(model, loader, device, is_binary=False, threshold=0.5,
                 # Handle (x_time, x_spec) tuple
                 x_time, x_spec = inputs
                 x_time, x_spec = x_time.to(device), x_spec.to(device)
-                outputs = model(x_spec)  # SCALENet only takes spectral input
+                outputs = model(x_spec)  # SPEN only takes spectral input
             else:
                 inputs = inputs.to(device)
                 outputs = model(inputs)
@@ -456,7 +456,7 @@ def run_ablation(task: str, save_dir: str = './ablation_results',
             checkpoint = torch.load(model_path, map_location=device)
             
             # Create model and load weights
-            eval_model = SCALENet(
+            eval_model = SPEN(
                 freq_bins=freq_bins,
                 time_bins=time_bins,
                 n_channels=n_channels,
@@ -805,7 +805,7 @@ def run_all_tasks_ablation(tasks: Optional[List[str]] = None,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description='STFT 27-Config Ablation Study for Adaptive SCALE-Net (27 settings)'
+        description='STFT 27-Config Ablation Study for ASPEN (27 settings)'
     )
     
     parser.add_argument(

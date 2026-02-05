@@ -1,8 +1,8 @@
 """
-AdaptiveSCALENet - Adaptive SCALE-Net Model for Multi-Task EEG Classification
+ASPEN: Adaptive Spectral Encoder Network
 
 Supports: SSVEP, P300, MI (Motor Imagery), Imagined Speech
-Dual-stream architecture with global attention fusion
+Dual-stream architecture with multiplicative fusion
 """
 
 import torch
@@ -98,12 +98,9 @@ class MultiplicativeFusion(nn.Module):
         fused = self.bn(fused)
         return fused, None
 
-class AdaptiveSCALENet(nn.Module):
+class ASPEN(nn.Module):
     """
-    Adaptive SCALE-Net: Dual-stream architecture with global attention fusion
-    
-    Combines spectral (STFT) and temporal (raw) streams with adaptive trial-level weighting.
-    
+    Combines spectral (STFT) and temporal (raw) streams
     Inputs:
         x_time: (B, C, T_raw) - Raw temporal EEG data
         x_spec: (B, C, F, T) - STFT features
@@ -794,7 +791,7 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
     
     # ====== Create Model ======
     n_classes = config['n_classes']
-    model = AdaptiveSCALENet(
+    model = ASPEN(
         freq_bins=freq_bins,
         time_bins=time_bins,
         n_channels=n_channels,
@@ -941,7 +938,7 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
         results['test2_auc'] = test2_metrics.get('auc')
     
     print(f"\n{'='*70}")
-    print(f"FINAL RESULTS - {task} (AdaptiveSCALENet Simplified)")
+    print(f"FINAL RESULTS - {task} (ASPEN)")
     print(f"{'='*70}")
     print(f"Best Val Acc: {best_val_acc:.2f}%")
     if results.get('val_f1') is not None:
@@ -1004,13 +1001,13 @@ def train_all_tasks(tasks: Optional[list] = None, save_dir: str = './checkpoints
         Dictionary of results for each task
     """
     if tasks is None:
-        tasks = ['SSVEP', 'P300', 'MI', 'Imagined_speech', 'Lee2019_MI', 'Lee2019_SSVEP', 'BNCI2014_P300', 'BI2014b_P300']
+        tasks = ['SSVEP', 'Lee2019_SSVEP', 'BI2014b_P300', 'BNCI2014_P300', 'MI', 'Lee2019_MI', 'Imagined_speech']
     
     os.makedirs(save_dir, exist_ok=True)
     all_results = {}
     
     print("=" * 80)
-    print("MULTI-TASK EEG CLASSIFICATION - AdaptiveSCALENet (Simplified)")
+    print("MULTI-TASK EEG CLASSIFICATION - ASPEN")
     print("=" * 80)
     
     for task in tasks:
@@ -1038,7 +1035,7 @@ def train_all_tasks(tasks: Optional[list] = None, save_dir: str = './checkpoints
     
     # Summary
     print(f"\n{'='*80}")
-    print("SUMMARY RESULTS - AdaptiveSCALENet (Simplified)")
+    print("SUMMARY RESULTS - ASPEN")
     print(f"{'='*80}")
     
     for task, results in all_results.items():
@@ -1068,9 +1065,9 @@ def train_model(config=None, model_path=None):
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description='Train AdaptiveSCALENet (Simplified) on EEG tasks')
+    parser = argparse.ArgumentParser(description='Train ASPEN on EEG tasks')
     parser.add_argument('--task', type=str, default='SSVEP',
-                       choices=['SSVEP', 'P300', 'MI', 'Imagined_speech', 'Lee2019_MI', 'Lee2019_SSVEP', 'BNCI2014_P300', 'BI2014b_P300', 'all'],
+                       choices=['SSVEP', 'Lee2019_SSVEP', 'BI2014b_P300', 'BNCI2014_P300', 'MI', 'Lee2019_MI', 'Imagined_speech', 'all'],
                        help='Task to train on (default: SSVEP)')
     parser.add_argument('--save_dir', type=str, default='./checkpoints',
                        help='Directory to save model checkpoints')
@@ -1111,6 +1108,6 @@ if __name__ == "__main__":
         results = train_all_tasks(save_dir=args.save_dir)
     else:
         seed = config.get('seed', 44)
-        model_path = os.path.join(args.save_dir, f'best_{args.task.lower()}_simplified_model_{seed}.pth')
+        model_path = os.path.join(args.save_dir, f'best_{args.task.lower()}_aspennet_model_{seed}.pth')
         os.makedirs(args.save_dir, exist_ok=True)
         model, results = train_task(args.task, config=config, model_path=model_path)

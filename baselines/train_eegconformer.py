@@ -19,8 +19,8 @@ import math
 from typing import Optional, Dict, Tuple
 from sklearn.metrics import f1_score, recall_score, roc_auc_score, average_precision_score, precision_recall_curve, precision_score
 
-# Add scale-net directory to path for imports
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scale-net'))
+# Add model directory to path for imports
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'model'))
 
 from seed_utils import seed_everything, worker_init_fn, get_generator
 from dataset import load_dataset, TASK_CONFIGS

@@ -3,10 +3,10 @@ __pycache__/
 **/__pycache__/
 *.pyc
 *.pyo
-/ablation/fusion_ablations/ablation_SSVEP/**
-/ablation/stft_params/ablation_results/**
-/scale-net/checkpoints/**
-/baseline/checkpoints/**
+/ablations/fusion_ablations/ablation_SSVEP/**
+/ablations/stft_params/ablation_results/**
+/model/checkpoints/**
+/baselines/checkpoints/**
 *.csv
 **/*.pth
 **/*.png

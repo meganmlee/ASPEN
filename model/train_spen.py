@@ -1,6 +1,6 @@
 """
-SCALENet with ResNet - Baseline Model for Multi-Task EEG Classification
-Supports: SSVEP, P300, MI (Motor Imagery), Imagined Speech
+SPEN - Spectral Encoder Network
+Supports: SSVEP, P300, MI (Motor Imagery)
 
 Single-stream spectral (STFT) architecture with ResNet-style residual blocks
 """
@@ -85,9 +85,8 @@ class SpectralResidualBlock(nn.Module):
         return out
 
 
-class SCALENet(nn.Module):
+class SPEN(nn.Module):
     """
-    SCALE-Net with ResNet: Channel-wise Spectral CNN-LSTM-DNN model
     Single-stream architecture using STFT features with residual blocks
     """
     
@@ -103,7 +102,7 @@ class SCALENet(nn.Module):
             hidden_dim: Dimension of hidden layer if use_hidden_layer=True (default: 64)
         """
         super().__init__()
-        print(f"[SCALENet-ResNet init] freq_bins={freq_bins}, time_bins={time_bins}, n_channels={n_channels}")
+        print(f"[SPEN init] freq_bins={freq_bins}, time_bins={time_bins}, n_channels={n_channels}")
         self.n_channels = n_channels
         self.freq_bins = freq_bins
         self.time_bins = time_bins
@@ -427,7 +426,7 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
     
     device, n_gpus = setup_device()
     print(f"\n{'='*70}")
-    print(f"{task} Classification (SCALENet-ResNet)")
+    print(f"{task} Classification (SPEN)")
     print(f"{'='*70}")
     print(f"Device: {device}, GPUs: {n_gpus}")
     
@@ -479,7 +478,7 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
     
     # Create Model
     n_classes = config['n_classes']
-    model = SCALENet(
+    model = SPEN(
         freq_bins=freq_bins,
         time_bins=time_bins,
         n_channels=n_channels,
@@ -602,7 +601,7 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
         results['test2_loss'] = test2_loss
     
     print(f"\n{'='*70}")
-    print(f"FINAL RESULTS - {task} (SCALENet-ResNet)")
+    print(f"FINAL RESULTS - {task} (SPEN)")
     print(f"{'='*70}")
     print(f"Best Val Acc:    {best_val_acc:.2f}%")
     if 'test1' in results:
@@ -617,9 +616,9 @@ def train_task(task: str, config: Optional[Dict] = None, model_path: Optional[st
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description='Train SCALENet-ResNet on EEG tasks')
+    parser = argparse.ArgumentParser(description='Train SPEN on EEG tasks')
     parser.add_argument('--task', type=str, default='SSVEP',
-                        choices=['SSVEP', 'P300', 'MI', 'Imagined_speech', 'Lee2019_MI', 'Lee2019_SSVEP', 'BNCI2014_P300', 'BI2014b_P300', 'all'],
+                        choices=['SSVEP', 'Lee2019_SSVEP', 'BI2014b_P300', 'BNCI2014_P300', 'MI', 'Lee2019_MI', 'Imagined_speech', 'all'],
                         help='Task to train on (default: SSVEP)')
     parser.add_argument('--save_dir', type=str, default='./checkpoints',
                         help='Directory to save model checkpoints')
@@ -651,9 +650,6 @@ if __name__ == "__main__":
         'seed': args.seed,
     }
     
-    if args.task == 'all':
-        results = train_all_tasks(save_dir=args.save_dir)
-    else:
-        model_path = os.path.join(args.save_dir, f'best_{args.task.lower()}_resnet_model.pth')
-        os.makedirs(args.save_dir, exist_ok=True)
-        model, results = train_task(args.task, config=config, model_path=model_path)
+    model_path = os.path.join(args.save_dir, f'best_{args.task.lower()}_resnet_model.pth')
+    os.makedirs(args.save_dir, exist_ok=True)
+    model, results = train_task(args.task, config=config, model_path=model_path)

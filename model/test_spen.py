@@ -1,5 +1,5 @@
 """
-Test script for SCALENet + SE Block
+Test script for SPEN
 Uses best_ssvep_model.pth checkpoint
 """
 
@@ -11,7 +11,7 @@ import argparse
 from sklearn.metrics import confusion_matrix
 
 # Import model and dataset functions from model_cldnn_se.py
-from train_scale_net import SCALENet
+from train_spen import SPEN
 from dataset import load_dataset, TASK_CONFIGS, create_dataloaders, get_stft_dimensions
 
 
@@ -217,7 +217,7 @@ def test_task(task, checkpoint_path, batch_size, checkpoint_dir='./checkpoints')
     n_classes = config['n_classes']
     is_binary = (n_classes == 2)
     
-    model = SCALENet(
+    model = SPEN(
         freq_bins=freq_bins,
         time_bins=time_bins,
         n_channels=n_channels,
@@ -291,7 +291,7 @@ def main_test_all(tasks, checkpoint_dir, batch_size):
     all_results = {}
     
     print("\n" + "=" * 80)
-    print("SCALENet + SE Block - Multi-Task Evaluation")
+    print("SPEN + SE Block - Multi-Task Evaluation")
     print("=" * 80)
     
     for task in tasks:
@@ -327,10 +327,10 @@ def main_test_all(tasks, checkpoint_dir, batch_size):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Test SCALENet on a specific EEG task or all tasks."
+        description="Test SPEN on a specific EEG task or all tasks."
     )
     
-    tasks_available = ['SSVEP', 'P300', 'MI', 'Imagined_speech']
+    tasks_available = ['SSVEP', 'Lee2019_SSVEP', 'BI2014b_P300', 'BNCI2014_P300', 'MI', 'Lee2019_MI', 'Imagined_speech']
     
     parser.add_argument(
         '--task', 

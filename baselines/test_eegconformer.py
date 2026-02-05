@@ -1,6 +1,6 @@
 """
-Test script for EEGNet Baseline Model
-Evaluates trained EEGNet models on validation and test sets
+Test script for EEGConformer Baseline Model
+Evaluates trained EEGConformer models on validation and test sets
 """
 
 import torch
@@ -9,12 +9,12 @@ from tqdm import tqdm
 import os
 import sys
 import argparse
-from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.metrics import confusion_matrix
 
-# Add scale-net directory to path for imports
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scale-net'))
+# Add model directory to path for imports
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'model'))
 
-from train_eegnet import EEGNet, create_raw_dataloaders
+from train_eegconformer import EEGConformer, create_raw_dataloaders
 from dataset import load_dataset, TASK_CONFIGS
 
 
@@ -23,15 +23,6 @@ from dataset import load_dataset, TASK_CONFIGS
 def evaluate(model, loader, device, is_binary=False):
     """
     Evaluate model on a dataset
-    
-    Args:
-        model: Model to evaluate
-        loader: DataLoader
-        device: Device to run on
-        is_binary: Whether this is binary classification (n_classes=2)
-    
-    Returns:
-        accuracy, predictions, labels
     """
     model.eval()
     correct, total = 0, 0
@@ -42,7 +33,6 @@ def evaluate(model, loader, device, is_binary=False):
             inputs, labels = inputs.to(device), labels.to(device)
             outputs = model(inputs)
             
-            # Prediction
             if is_binary:
                 pred = (torch.sigmoid(outputs) > 0.5).squeeze(1).long()
             else:
@@ -60,29 +50,24 @@ def evaluate(model, loader, device, is_binary=False):
 # ==================== Confusion Matrix ====================
 
 def print_confusion_matrix(y_true, y_pred, n_classes, title="Confusion Matrix"):
-    """
-    Print confusion matrix as text in terminal
-    """
+    """Print confusion matrix as text in terminal"""
     cm = confusion_matrix(y_true, y_pred, labels=list(range(n_classes)))
     
-    # Generate class labels
     if n_classes == 2:
         class_labels = ['Non-Target', 'Target']
     elif n_classes == 4:
         class_labels = ['Class 0', 'Class 1', 'Class 2', 'Class 3']
     elif n_classes == 26:
-        class_labels = [chr(65 + i) for i in range(n_classes)]  # A-Z
+        class_labels = [chr(65 + i) for i in range(n_classes)]
     else:
         class_labels = [str(i) for i in range(n_classes)]
     
     print(f"\n{title}")
     print("=" * 60)
     
-    # For large confusion matrices, just show summary statistics
     if n_classes > 10:
         print(f"(Confusion matrix too large to display, showing summary only)")
     else:
-        # Header
         header = "True\\Pred"
         for label in class_labels:
             header += f"{label:>8s}"
@@ -90,7 +75,6 @@ def print_confusion_matrix(y_true, y_pred, n_classes, title="Confusion Matrix"):
         print(header)
         print("-" * len(header))
         
-        # Each row
         for i in range(n_classes):
             row = f"{class_labels[i]:>9s}"
             total_true = cm[i].sum()
@@ -101,7 +85,6 @@ def print_confusion_matrix(y_true, y_pred, n_classes, title="Confusion Matrix"):
         
         print("-" * len(header))
         
-        # Column totals
         col_totals = cm.sum(axis=0)
         row = "    Total"
         for total in col_totals:
@@ -111,7 +94,6 @@ def print_confusion_matrix(y_true, y_pred, n_classes, title="Confusion Matrix"):
     
     print("=" * 60)
     
-    # Summary statistics
     correct = np.sum(y_true == y_pred)
     total = len(y_true)
     accuracy = 100. * correct / total
@@ -121,7 +103,6 @@ def print_confusion_matrix(y_true, y_pred, n_classes, title="Confusion Matrix"):
     print(f"  Correct predictions: {correct}")
     print(f"  Overall accuracy: {accuracy:.2f}%")
     
-    # Per-class accuracy (top 5 worst and best for large n_classes)
     print(f"\nPer-class accuracy:")
     class_acc = []
     for i in range(n_classes):
@@ -131,7 +112,6 @@ def print_confusion_matrix(y_true, y_pred, n_classes, title="Confusion Matrix"):
         class_acc.append((i, cls_acc_val, cls_correct, cls_total))
     
     if n_classes > 10:
-        # Show top 5 best and worst
         class_acc_sorted = sorted(class_acc, key=lambda x: x[1])
         print("  Worst 5 classes:")
         for i, acc, correct, total in class_acc_sorted[:5]:
@@ -147,24 +127,13 @@ def print_confusion_matrix(y_true, y_pred, n_classes, title="Confusion Matrix"):
 # ==================== Main Test ====================
 
 def test_task(task: str, checkpoint_path: str, batch_size: int = 32):
-    """
-    Test EEGNet model for a specific task
-    
-    Args:
-        task: Task name
-        checkpoint_path: Path to model checkpoint
-        batch_size: Batch size for evaluation
-        
-    Returns:
-        Dictionary of results
-    """
+    """Test EEGConformer model for a specific task"""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     print(f"\n{'='*70}")
-    print(f"Testing EEGNet - Task: {task}")
+    print(f"Testing EEGConformer - Task: {task}")
     print(f"{'='*70}")
     
-    # 1. Load Checkpoint
     if not os.path.exists(checkpoint_path):
         print(f"Checkpoint not found: {checkpoint_path}")
         return {'task': task, 'error': 'Checkpoint not found'}
@@ -175,14 +144,12 @@ def test_task(task: str, checkpoint_path: str, batch_size: int = 32):
         print(f"Failed to load checkpoint: {e}")
         return {'task': task, 'error': f'Checkpoint loading failed: {e}'}
     
-    # Get config from checkpoint
     saved_config = checkpoint.get('config', {})
-    eegnet_config = checkpoint.get('eegnet_config', {})
+    conformer_config = checkpoint.get('conformer_config', {})
     n_channels = checkpoint.get('n_channels')
     n_samples = checkpoint.get('n_samples')
     task_defaults = TASK_CONFIGS.get(task, {})
     
-    # Merge configs
     config = {
         'num_seen': saved_config.get('num_seen', task_defaults.get('num_seen', 33)),
         'seed': saved_config.get('seed', 44),
@@ -194,7 +161,6 @@ def test_task(task: str, checkpoint_path: str, batch_size: int = 32):
     print(f"Checkpoint: {checkpoint_path}")
     print(f"Data Dir: {config['data_dir']}")
     
-    # 2. Load Data
     datasets = load_dataset(
         task=task,
         data_dir=config['data_dir'],
@@ -214,36 +180,34 @@ def test_task(task: str, checkpoint_path: str, batch_size: int = 32):
     test1_loader = loaders.get('test1')
     test2_loader = loaders.get('test2')
     
-    # Get dimensions from data if not in checkpoint
     if n_channels is None or n_samples is None:
         sample_x, _ = next(iter(val_loader))
         n_channels = sample_x.shape[1]
         n_samples = sample_x.shape[2]
     
-    # 3. Create Model and Load Weights
     n_classes = config['n_classes']
     is_binary = (n_classes == 2)
     
-    # Default EEGNet config if not saved
-    if not eegnet_config:
-        eegnet_config = {
-            'F1': 8,
-            'D': 2,
-            'F2': 16,
-            'kernel_length': 64,
-            'dropout_rate': 0.5,
-            'pool1': 4,
-            'pool2': 8,
+    if not conformer_config:
+        conformer_config = {
+            'embed_dim': 40,
+            'n_heads': 10,
+            'n_layers': 6,
+            'dim_ff': 256,
+            'kernel_size': 25,
+            'pool_size': 75,
+            'pool_stride': 15,
+            'dropout': 0.5,
+            'emb_dropout': 0.5,
         }
     
-    model = EEGNet(
+    model = EEGConformer(
         n_channels=n_channels,
         n_samples=n_samples,
         n_classes=n_classes,
-        **eegnet_config
+        **conformer_config
     ).to(device)
     
-    # Load state dict
     if 'model_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['model_state_dict'])
     else:
@@ -254,34 +218,29 @@ def test_task(task: str, checkpoint_path: str, batch_size: int = 32):
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {n_params:,}")
     
-    # 4. Evaluate
     print(f"\n{'='*70}")
     print("Evaluating...")
     print(f"{'='*70}")
     
     results = {'task': task}
     
-    # Validation set
     val_acc, val_preds, val_labels = evaluate(model, val_loader, device, is_binary=is_binary)
     results['val_acc'] = val_acc
     
-    # Test1 (Seen subjects)
     if test1_loader:
         test1_acc, test1_preds, test1_labels = evaluate(model, test1_loader, device, is_binary=is_binary)
         results['test1_acc'] = test1_acc
     else:
         test1_acc, test1_preds, test1_labels = None, None, None
     
-    # Test2 (Unseen subjects)
     if test2_loader:
         test2_acc, test2_preds, test2_labels = evaluate(model, test2_loader, device, is_binary=is_binary)
         results['test2_acc'] = test2_acc
     else:
         test2_acc, test2_preds, test2_labels = None, None, None
     
-    # 5. Print Results
     print(f"\n{'='*70}")
-    print(f"RESULTS - {task} (EEGNet)")
+    print(f"RESULTS - {task} (EEGConformer)")
     print(f"{'='*70}")
     print(f"Validation Acc:  {val_acc:.2f}%")
     if test1_acc is not None:
@@ -290,7 +249,6 @@ def test_task(task: str, checkpoint_path: str, batch_size: int = 32):
         print(f"Test2 (Unseen):  {test2_acc:.2f}%")
     print(f"{'='*70}")
     
-    # Confusion matrices
     if test1_preds is not None and test1_labels is not None:
         print_confusion_matrix(
             test1_labels, test1_preds, n_classes,
@@ -307,23 +265,20 @@ def test_task(task: str, checkpoint_path: str, batch_size: int = 32):
 
 
 def test_all_tasks(tasks: list, checkpoint_dir: str, batch_size: int = 32):
-    """
-    Test EEGNet on all specified tasks
-    """
+    """Test EEGConformer on all specified tasks"""
     all_results = {}
     
     print("\n" + "=" * 80)
-    print("EEGNet Baseline - Multi-Task Evaluation")
+    print("EEGConformer - Multi-Task Evaluation")
     print("=" * 80)
     
     for task in tasks:
-        checkpoint_path = os.path.join(checkpoint_dir, f'best_eegnet_{task.lower()}_model.pth')
+        checkpoint_path = os.path.join(checkpoint_dir, f'best_conformer_{task.lower()}_model.pth')
         results = test_task(task, checkpoint_path, batch_size)
         all_results[task] = results
     
-    # Final Summary
     print(f"\n{'='*80}")
-    print("FINAL SUMMARY - EEGNet Baseline")
+    print("FINAL SUMMARY - EEGConformer")
     print(f"{'='*80}")
     
     for task, results in all_results.items():
@@ -342,11 +297,9 @@ def test_all_tasks(tasks: list, checkpoint_dir: str, batch_size: int = 32):
     return all_results
 
 
-# ==================== Main Entry Point ====================
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Test EEGNet baseline model on EEG tasks"
+        description="Test EEGConformer model on EEG tasks"
     )
     
     tasks_available = ['SSVEP', 'P300', 'MI', 'Imagined_speech', 'Lee2019_MI', 'Lee2019_SSVEP', 'BNCI2014_P300']
@@ -382,7 +335,7 @@ if __name__ == "__main__":
     else:
         checkpoint_path = os.path.join(
             args.checkpoint_dir, 
-            f'best_eegnet_{args.task.lower()}_model.pth'
+            f'best_conformer_{args.task.lower()}_model.pth'
         )
         test_task(
             task=args.task, 

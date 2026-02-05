@@ -25,8 +25,8 @@ import os
 import sys
 from typing import Optional, Dict, Tuple, List
 
-# Add scale-net directory to path for imports
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scale-net'))
+# Add model directory to path for imports
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'model'))
 
 try:
     from seed_utils import seed_everything, worker_init_fn, get_generator

@@ -1,9 +1,9 @@
 """
-Fusion Ablation Study for EEG Classification using AdaptiveSCALENet Architecture
+Fusion Ablation Study for EEG Classification using ASPEN Architecture
 
 Tests 7 different fusion strategies:
 1. static - Equal 0.5/0.5 weighting
-2. global_attention - Trial-level dynamic weighting (same as AdaptiveSCALENet)
+2. global_attention - Trial-level dynamic weighting (same as ASPEN)
 3. spatial_attention - Per-channel weighting before global pooling
 4. glu - Gated Linear Unit (noise suppression)
 5. multiplicative - Element-wise feature interaction
@@ -24,15 +24,16 @@ from sklearn.metrics import f1_score, recall_score, roc_auc_score, average_preci
 import matplotlib.pyplot as plt
 import seaborn as sns
 import mne
-# Import utilities
-scale_net_path = os.path.join(os.path.dirname(__file__), '..', '..', 'scale_net')
-sys.path.insert(0, scale_net_path)
+
+# Add model directory to path
+model_path = os.path.join(os.path.dirname(__file__), '..', '..', 'model')
+sys.path.insert(0, model_path)
 
 from seed_utils import seed_everything
 from dataset import load_dataset, TASK_CONFIGS, create_dataloaders
 
-# Import shared components from scale_net_adaptive_v2
-from scale_net_adaptive_v2 import (
+# Import shared components from ASPEN
+from train_aspen import (
     SqueezeExcitation,
     SpectralResidualBlock,
     setup_device,
@@ -57,7 +58,7 @@ class StaticFusion(nn.Module):
 
 class GlobalAttentionFusion(nn.Module):
     """
-    Trial-level global attention fusion (same as AdaptiveSCALENet).
+    Trial-level global attention fusion (same as ASPEN).
     Dynamically weights spectral and temporal streams per trial.
     """
     def __init__(self, dim, temperature=2.0, dropout=0.1, **kwargs):
@@ -301,11 +302,11 @@ def get_fusion_layer(mode, dim, n_channels=None, temperature=2.0, rank=16, num_h
         raise ValueError(f"Unknown fusion mode: {mode}")
 
 
-# ==================== AdaptiveSCALENet with Configurable Fusion ====================
+# ==================== ASPEN with Configurable Fusion ====================
 
-class AdaptiveSCALENetAblation(nn.Module):
+class ASPENAblation(nn.Module):
     """
-    EXACT same architecture as AdaptiveSCALENet from scale_net_adaptive_v2.py
+    EXACT same architecture as ASPEN from train_aspen.py
     with configurable fusion layer for ablation study.
     
     Architecture:
@@ -1016,7 +1017,7 @@ def run_ablation_study(task: str, config: Dict = None):
             'seed': 44,
             'patience': 15,
             
-            # Model architecture (matching AdaptiveSCALENet)
+            # Model architecture (matching ASPEN)
             'cnn_filters': 24,
             'hidden_dim': 256,
             'dropout': 0.3,
@@ -1033,7 +1034,7 @@ def run_ablation_study(task: str, config: Dict = None):
     print(f"{'='*70}")
     print(f"Device: {device}, GPUs: {n_gpus}")
     print(f"Testing {len(strategies)} fusion strategies")
-    print(f"Architecture: AdaptiveSCALENet (matching scale_net_adaptive_v2.py)")
+    print(f"Architecture: ASPEN (matching train_aspen.py)")
     print(f"{'='*70}\n")
 
     print("STFT Configuration:")
@@ -1096,8 +1097,8 @@ def run_ablation_study(task: str, config: Dict = None):
         print(f"Data: {n_channels} channels, {n_classes} classes")
         print(f"Spectral: {freq_bins}x{time_bins}, Temporal: {T_raw} samples")
         
-        # Create model (matching AdaptiveSCALENet architecture exactly)
-        model = AdaptiveSCALENetAblation(
+        # Create model (matching ASPEN architecture exactly)
+        model = ASPENAblation(
             freq_bins=freq_bins,
             time_bins=time_bins,
             n_channels=n_channels,
@@ -1120,7 +1121,7 @@ def run_ablation_study(task: str, config: Dict = None):
         n_params = sum(p.numel() for p in model.parameters())
         print(f"Model parameters: {n_params:,}")
         
-        # Training setup (matching AdaptiveSCALENet)
+        # Training setup (matching ASPEN)
         optimizer = torch.optim.Adam(
             model.parameters(), 
             lr=config['lr'],
@@ -1140,7 +1141,7 @@ def run_ablation_study(task: str, config: Dict = None):
         else:
             criterion = nn.CrossEntropyLoss()
         
-        # Scheduler (matching AdaptiveSCALENet)
+        # Scheduler (matching ASPEN)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode='min',
@@ -1266,7 +1267,7 @@ def run_ablation_study(task: str, config: Dict = None):
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description='Run fusion ablation study (AdaptiveSCALENet architecture)')
+    parser = argparse.ArgumentParser(description='Run fusion ablation study (ASPEN architecture)')
     parser.add_argument('--task', type=str, required=True,
                         choices=['SSVEP', 'P300', 'MI', 'Imagined_speech',
                                 'Lee2019_MI', 'Lee2019_SSVEP', 'BNCI2014_P300', 'BI2014b_P300'])
@@ -1295,7 +1296,7 @@ if __name__ == "__main__":
         'seed': args.seed,
         'patience': args.patience,
         
-        # Model architecture (matching AdaptiveSCALENet exactly)
+        # Model architecture
         'cnn_filters': 24,
         'hidden_dim': 256,
         'dropout': 0.3,
